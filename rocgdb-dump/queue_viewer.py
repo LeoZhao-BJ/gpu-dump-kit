@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Standalone offline viewer for the .bin queue dumps produced by
-queue_script.py's `dump_all_queues_bin` rocgdb command.
+rocgdb_helper.py's `dump_all_queues_bin` rocgdb command.
 
 No gdb dependency at all -- this reads the raw ring bytes straight out of
 the dump file and decodes packets against an in-memory buffer, using the
@@ -16,7 +16,9 @@ REPL prompt commands:
     range A B             decode and show packets A..B (inclusive)
     all                   decode the whole ring
     raw N                 hex-dump the raw bytes for packet/slot N
-    rptr / wptr           jump to the packet at the read/write pointer (HSA only)
+    rptr / wptr           jump to the packet at the read/write pointer
+                          (HSA: always available; DMA/XGMI: only if the dump
+                          carries SDMA rptr/wptr enrichment -- see README)
     help                  show this list
     quit / exit           leave
 """
@@ -183,24 +185,61 @@ class QueueDump:
     def jump_to_pointer(self, which, emit=print):
         """which: 'read' (rptr) or 'write' (wptr)."""
         label = "rptr" if which == "read" else "wptr"
-        if not self.is_hsa:
-            # `info queue` only ever reports Read/Write for HSA rows --
-            # DMA/XGMI rings have no rptr/wptr concept to jump to.
-            emit(f"{label} navigation is only available for HSA queues (this is {self.qtype})")
-            return
         val = self.metadata.get(which)
         if val is None:
-            emit(f"no {label} recorded in this dump's metadata")
+            if self.is_hsa:
+                emit(f"no {label} recorded in this dump's metadata")
+            else:
+                # `info queue` never reports Read/Write for DMA/XGMI rows,
+                # so this is only available when rocgdb_helper.py's
+                # best-effort SDMA-pointer enrichment (reads KFD debugfs,
+                # needs root) found and recorded a value -- see README.
+                emit(
+                    f"no {label} recorded in this dump's metadata -- {self.qtype} "
+                    f"rptr/wptr requires the dump-time SDMA enrichment step "
+                    f"(root access to KFD debugfs) to have found this queue"
+                )
             return
-        count = self._hsa_count()
-        if count == 0:
-            emit("queue has no packet slots (size 0)")
+
+        if self.is_hsa:
+            count = self._hsa_count()
+            if count == 0:
+                emit("queue has no packet slots (size 0)")
+                return
+            # Read/Write from `info queue` are raw, monotonically-increasing
+            # packet-ID counters, not slot indices -- same wraparound
+            # `dump_hsa_queue` itself applies (see rocgdb_helper.py:
+            # `idx %= size_bytes // 64`).
+            idx = val % count
+            emit(f"{label} (raw={val}) -> slot index {idx} (of {count})")
+            self.print_packets(idx, idx + 1, emit=emit)
             return
-        # Read/Write from `info queue` are raw, monotonically-increasing
-        # counters, not slot indices -- same wraparound `dump_hsa_queue`
-        # itself applies (see queue_script.py: `idx %= size_bytes // 64`).
-        idx = val % count
-        emit(f"{label} (raw={val}) -> slot index {idx} (of {count})")
+
+        # SDMA/XGMI: `val` is a ring-relative *dword slot*, not a packet
+        # index -- packets are variable-length, so there's no equivalent
+        # "packet index" concept the way HSA has one (see rocgdb_helper.py's
+        # _enrich_sdma_pointers() docstring). Convert to a byte offset from
+        # the ring base and find which already-decoded packet contains it.
+        self._ensure_sdma_walked()
+        byte_addr = self.metadata["addr"] + val * 4
+        ring_end = self.metadata["addr"] + self.metadata["size"]
+        idx = None
+        for i, start in enumerate(self._sdma_addrs):
+            if start is None:
+                continue
+            end = ring_end
+            if i + 1 < len(self._sdma_addrs) and self._sdma_addrs[i + 1] is not None:
+                end = self._sdma_addrs[i + 1]
+            if start <= byte_addr < end:
+                idx = i
+                break
+        if idx is None:
+            emit(
+                f"{label} (dword_slot={val}) -> byte offset 0x{val * 4:x}, "
+                f"but no decoded packet contains it"
+            )
+            return
+        emit(f"{label} (dword_slot={val}) -> byte offset 0x{val * 4:x} -> packet index {idx}")
         self.print_packets(idx, idx + 1, emit=emit)
 
 
@@ -211,8 +250,11 @@ Commands:
   range A B            decode and show packets A..B (inclusive)
   all                  decode the whole ring
   raw N                hex-dump the raw bytes for packet/slot N
-  rptr                 jump to and decode the packet at the read pointer (HSA only)
-  wptr                 jump to and decode the packet at the write pointer (HSA only)
+  rptr                 jump to and decode the packet at the read pointer
+                       (HSA: always available; DMA/XGMI: only if the dump
+                       carries SDMA rptr/wptr enrichment -- see README)
+  wptr                 jump to and decode the packet at the write pointer
+                       (same availability note as rptr)
   help                 show this list
   quit / exit          leave
 """

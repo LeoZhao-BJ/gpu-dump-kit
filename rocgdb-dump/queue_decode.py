@@ -1,7 +1,7 @@
 """Shared, gdb-independent HSA/SDMA packet decoding + binary dump format.
 
 This module has NO dependency on gdb -- it's imported both by
-`queue_script.py` (running live inside rocgdb's embedded Python interpreter,
+`rocgdb_helper.py` (running live inside rocgdb's embedded Python interpreter,
 via a GdbReader adapter around `inferior.read_memory()`) and by
 `queue_viewer.py` (a standalone tool that reads packets out of a binary dump
 file on disk, with no gdb or live process involved at all).
@@ -9,7 +9,7 @@ file on disk, with no gdb or live process involved at all).
 Keeping the packet-format knowledge in exactly one place means the live path
 and the offline viewer can never drift apart on how a packet is decoded, and
 keeping the binary dump container format (write_dump_header/read_dump_header
-below) here too means the writer (queue_script.py) and reader
+below) here too means the writer (rocgdb_helper.py) and reader
 (queue_viewer.py) can never disagree on the file layout either.
 
 Callers of decode_hsa_packets/decode_sdma_packets provide a `reader`: any
@@ -28,7 +28,7 @@ class MemoryReadError(Exception):
 
 # --- binary dump container format -------------------------------------
 #
-# One file per queue, written by queue_script.py's dump_all_queues_bin and
+# One file per queue, written by rocgdb_helper.py's dump_all_queues_bin and
 # read by queue_viewer.py -- kept here so both sides can never disagree on
 # the wire format:
 #
