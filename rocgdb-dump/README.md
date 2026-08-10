@@ -31,6 +31,12 @@ Leo Zhao (2026-08):
 - Best-effort SDMA rptr/wptr enrichment for DMA/XGMI queues, read straight out of KFD debugfs
   (no `umr` dependency), plus `rptr`/`wptr` jump navigation for DMA/XGMI in `queue_viewer.py`
   (see "SDMA rptr/wptr enrichment" below).
+- Full SDMA packet decode, ported from UMR's own SDMA source
+  (`umr/src/lib/packet/sdma/read_sdma_stream.c` + `sdma_decode_opcodes.c`) -- replacing an
+  earlier, much narrower decoder that only handled 5 opcodes and, worse, silently mis-sized
+  several of them (every `COPY` was assumed to be the `LINEAR` sub-opcode's 28 bytes; every
+  `POLL_REGMEM` was assumed to be the `MEM` sub-opcode's 24 bytes), desyncing every packet
+  after the first mismatch for the rest of the ring (see "SDMA packet decode" below).
 
 ## Files
 
@@ -192,10 +198,56 @@ matching is done purely by ring base address across every SDMA queue on the syst
 which sidesteps the mismatch (and is safe: these ring addresses are effectively unique across
 processes).
 
+**Running on a shared, multi-tenant host** (bare metal, no container involved): the same
+system-wide scan applies -- `/sys/kernel/debug/kfd/mqds` lists *every* process's SDMA queues,
+most of which belong to other users' jobs that this rocgdb session has no ptrace access to.
+The scan narrows to ring-base-address matches against your own attached process's queues
+*before* attempting any actual memory read, so this shows up as silence (no "Cannot access
+memory" spam for queues that were never going to be yours), not failures -- if you do see a
+"Cannot access memory" enrichment failure for one of *your own* queues, that's a real problem
+worth investigating (wrong offset table for this generation, a truncated/stale MQD snapshot,
+etc.), not the expected multi-tenant noise.
+
 **Units differ from HSA:** the Read/Write values this produces are a **ring-relative dword
 slot** (byte offset = value * 4), not a monotonic packet ID -- SDMA packets are variable-length,
 so there's no equivalent "packet index" concept. Don't compare DMA/XGMI Read/Write numbers
 directly against HSA ones; they mean different things.
+
+### SDMA packet decode
+
+`queue_decode.py`'s SDMA decoder (`decode_sdma_packets`, shared by the live `dump_all_queues`/
+`dump_sdma_queue` and `queue_viewer.py`) is a port of UMR's own SDMA parsing source:
+
+- **Sizing** -- how many bytes each packet occupies, needed to find the next packet -- is a
+  full port of `read_sdma_stream.c`'s `sized_oss1_5()`: every opcode and sub-opcode, generation-
+  agnostic across SDMA/OSS IP versions 1-6 (checked against this host's actual SDMA IP version
+  via `ip_discovery`). This matters because SDMA packets are variable-length: getting a size
+  wrong desyncs every packet after it for the rest of the ring. (The previous decoder didn't do
+  this -- it assumed every `COPY` was the `LINEAR` sub-opcode's fixed 28 bytes and every
+  `POLL_REGMEM` was the `MEM` sub-opcode's fixed 24 bytes, silently corrupting the rest of the
+  ring's decode whenever a different sub-opcode showed up.)
+- **Field-level decode** -- the human-readable "Copy Packet Fields:", "Fence Packet Fields:",
+  etc. blocks -- is a port of `sdma_decode_opcodes.c`'s `decode_upto_ai()`, the one (of four:
+  VI/AI/NV/OSS7) generation-specific decoder that matches this host's confirmed SDMA IP version
+  (major 4, minor 4 -- cross-checked against `sdma_decode_opcodes.c`'s own version-gating logic).
+  **The other three generations are not ported** -- an unrecognized-but-correctly-sized packet
+  just gets a generic `(recognized, N bytes, not decoded in detail)` line instead of a field
+  breakdown; the ring walk stays correct either way. Verified against real hardware: replayed
+  against every DMA/XGMI queue already captured in this repo (tens of thousands of real packets
+  across several rings) with zero decode errors and zero "not decoded in detail" fallbacks --
+  real traffic on this host is entirely `COPY`/`TIMESTAMP`/`POLL_REGMEM`/`ATOMIC`, all fully
+  covered.
+- Two deliberate additions beyond straight 1:1 porting: `INDIRECT` packets print their
+  descriptor (address/vmid/size) and are followed one level deep automatically -- this works
+  live (rocgdb can read anywhere in the process) and fails cleanly with "IB not available in
+  this dump" offline (a `.bin` dump only contains its own ring's bytes); `TRAP` keeps a decoded
+  `TRAP_INT_CONTEXT` field. UMR's own AI-generation decoder does neither (it falls through to
+  the older, generation-agnostic decoder for these two opcodes, which itself skips `INDIRECT`'s
+  fields entirely) -- these are small, code-comment-flagged deviations, not accuracy issues.
+- A handful of legacy tiling-mode sub-opcodes (`COPY`'s `*_BC` variants, `WRITE`'s `TILED_BC`) are
+  intentionally not field-decoded -- they're pre-GCN/early-GCN modes that don't occur on this
+  hardware in practice, and are exactly the opcodes UMR's own AI decoder defers on too. They're
+  still sized correctly (so the ring walk never desyncs), just shown generically.
 
 ### Browser UI instead of the REPL
 Same tool, `--web` instead of nothing, and point it at a whole `dump_all_queues_bin` output

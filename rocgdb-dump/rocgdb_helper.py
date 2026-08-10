@@ -531,6 +531,19 @@ def _enrich_sdma_pointers(rows):
     values filled in here are ring-relative dword slots (byte offset =
     value * 4) -- SDMA packets are variable-length, so there's no equivalent
     "packet index". Do not conflate the two when consuming this field.
+
+    Residual caveat: matching is purely by ring base virtual address across
+    every SDMA queue on the (possibly shared, multi-tenant) system, since
+    there's no reliable pid to filter by (see _parse_mqds_sdma_queues's
+    docstring). Virtual addresses are per-process, so it's theoretically
+    possible -- if very unlikely, given these are high-entropy mmap'd
+    addresses -- for a *different* process's queue to coincidentally share
+    the same rb_base as one of ours. Because the actual memory read only
+    ever goes through *our* attached inferior (ptrace enforces this; we can
+    never read another process's memory even if its address coincidentally
+    matches), such a collision would silently attribute an unrelated,
+    successfully-read value to our queue rather than erroring out. Accepted
+    as a low-probability trade-off for a best-effort diagnostic feature.
     """
     sdma_rows = [r for r in rows if r["type"] in _SDMA_LIKE_TYPES and r["read"] is None]
     if not sdma_rows:
@@ -551,12 +564,35 @@ def _enrich_sdma_pointers(rows):
     if not mqd_queues:
         return
 
+    # `_parse_mqds_sdma_queues()` is system-wide (see its docstring) -- on a
+    # shared host, most of what it finds belongs to OTHER processes we have
+    # no ptrace access to. Computing rb_base is cheap, pure arithmetic on the
+    # MQD words (no memory read, no generation lookup needed -- rb_base's
+    # offset is identical across every generation we support), so narrow
+    # down to only the queues whose rb_base matches one of our own rows
+    # *before* attempting the (fallible, and for everyone else's queues,
+    # guaranteed-to-fail) rptr/wptr memory reads. Without this, a busy host
+    # prints a wall of expected "Cannot access memory" failures for queues
+    # that were never going to be ours.
+    wanted_addrs = {row["addr"] for row in sdma_rows}
+    candidates = []
+    for device_hex, mqdwords in mqd_queues:
+        try:
+            rb_base = _mqd_rb_base(mqdwords)
+        except IndexError:
+            continue
+        if rb_base in wanted_addrs:
+            candidates.append((device_hex, mqdwords, rb_base))
+
+    if not candidates:
+        return
+
     gfx_maj_cache = {}
     inferior = gdb.selected_inferior()
     pointers_by_addr = {}
     warned_gens = set()
 
-    for device_hex, mqdwords in mqd_queues:
+    for device_hex, mqdwords, rb_base in candidates:
         try:
             if device_hex not in gfx_maj_cache:
                 gfx_maj_cache[device_hex] = _resolve_gfx_maj(device_hex)
@@ -578,7 +614,6 @@ def _enrich_sdma_pointers(rows):
                 continue
 
             offsets = _SDMA_MQD_OFFSETS[gfx_maj]
-            rb_base = _mqd_rb_base(mqdwords)
 
             r_hi, r_lo = offsets["rptr"]
             rptr_addr = ((mqdwords[r_hi] << 32) | mqdwords[r_lo]) & ~7
