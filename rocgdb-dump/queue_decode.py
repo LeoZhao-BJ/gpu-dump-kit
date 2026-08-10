@@ -268,11 +268,23 @@ def _sdma_nwords(reader, addr, op, sub_op, header_dw):
     return None
 
 
-def _sdma_decode_fields(op, sub_op, header_dw, words, emit):
-    """Decode and emit the field breakdown for one SDMA packet's body.
+def _sdma_decode_fields(op, sub_op, header_dw, words):
+    """Decode one SDMA packet's body into a structured field list.
     `words[i]` is the dword at byte offset 4+4*i, i.e. immediately after the
-    header dword. Returns True if this opcode/sub-opcode was decoded in
-    detail; False means the caller should fall back to a generic dump.
+    header dword.
+
+    Returns (label, fields, decoded):
+      - label: ALL-CAPS packet type name (e.g. "COPY (LINEAR)"), or None
+        if the opcode/sub-opcode wasn't recognized.
+      - fields: list of (word_ref, name, value_str) in display order.
+        word_ref is None (derived from the header dword itself), an int i
+        (single word, byte offset 4+4*i), or a 2-tuple (i, j) with j==i+1
+        (a 64-bit LO/HI field spanning two consecutive words) -- the
+        caller's renderer uses this to lay out the hex/field two-column
+        view and group fields that share a dword.
+      - decoded: False means the caller should fall back to a generic dump
+        (still correctly sized -- see _sdma_nwords -- just not broken down
+        field-by-field).
 
     Port of sdma_decode_opcodes.c's decode_upto_ai() -- the one generation
     that matches this host's confirmed SDMA IP version (OSS 4.4, see
@@ -299,450 +311,452 @@ def _sdma_decode_fields(op, sub_op, header_dw, words, emit):
     pitch_mask = 0x7FFFF
     pitch_shift = 13
 
-    def hx(name, value):
-        emit(f"  {name}=0x{value:x}")
+    fields = []
 
-    def dec(name, value):
-        emit(f"  {name}={value}")
+    def hx(name, value, word=None):
+        fields.append((word, name, f"0x{value:x}"))
+
+    def dec(name, value, word=None):
+        fields.append((word, name, str(value)))
 
     if op == 1:  # COPY
         if sub_op == 0:  # LINEAR (broadcast or not)
             broadcast = bool(header_dw & (1 << 27))
-            emit(f"Copy Packet Fields ({'LINEAR BROADCAST' if broadcast else 'LINEAR'}):")
+            label = f"COPY ({'LINEAR BROADCAST' if broadcast else 'LINEAR'})"
             dec("ENCRYPT", (header_dw >> 16) & 0x1)
             dec("TMZ", (header_dw >> 18) & 0x1)
             if not broadcast:
                 dec("BACKWARDS", (header_dw >> 25) & 0x1)
             dec("BROADCAST", (header_dw >> 27) & 0x1)
-            dec("COPY_COUNT", words[0])
+            dec("COPY_COUNT", words[0], word=0)
             if not broadcast:
-                dec("DST_SW", (words[1] >> 16) & 3)
-                dec("DST_CACHE_POLICY", (words[1] >> 18) & 0x7)
-                dec("SRC_SW", (words[1] >> 24) & 3)
-                dec("SRC_CACHE_POLICY", (words[1] >> 26) & 0x7)
-                hx("SRC_ADDR", (words[3] << 32) | words[2])
-                hx("DST_ADDR", (words[5] << 32) | words[4])
+                dec("DST_SW", (words[1] >> 16) & 3, word=1)
+                dec("DST_CACHE_POLICY", (words[1] >> 18) & 0x7, word=1)
+                dec("SRC_SW", (words[1] >> 24) & 3, word=1)
+                dec("SRC_CACHE_POLICY", (words[1] >> 26) & 0x7, word=1)
+                hx("SRC_ADDR", (words[3] << 32) | words[2], word=(2, 3))
+                hx("DST_ADDR", (words[5] << 32) | words[4], word=(4, 5))
             else:
-                dec("DST2_SW", (words[1] >> 8) & 3)
-                dec("DST2_CACHE_POLICY", (words[1] >> 10) & 0x7)
-                dec("DST_SW", (words[1] >> 16) & 3)
-                dec("DST_CACHE_POLICY", (words[1] >> 18) & 0x7)
-                dec("SRC_SW", (words[1] >> 24) & 3)
-                dec("SRC_CACHE_POLICY", (words[1] >> 26) & 0x7)
-                hx("SRC_ADDR", (words[3] << 32) | words[2])
-                hx("DST_ADDR", (words[5] << 32) | words[4])
-                hx("DST2_ADDR", (words[7] << 32) | words[6])
-            return True
+                dec("DST2_SW", (words[1] >> 8) & 3, word=1)
+                dec("DST2_CACHE_POLICY", (words[1] >> 10) & 0x7, word=1)
+                dec("DST_SW", (words[1] >> 16) & 3, word=1)
+                dec("DST_CACHE_POLICY", (words[1] >> 18) & 0x7, word=1)
+                dec("SRC_SW", (words[1] >> 24) & 3, word=1)
+                dec("SRC_CACHE_POLICY", (words[1] >> 26) & 0x7, word=1)
+                hx("SRC_ADDR", (words[3] << 32) | words[2], word=(2, 3))
+                hx("DST_ADDR", (words[5] << 32) | words[4], word=(4, 5))
+                hx("DST2_ADDR", (words[7] << 32) | words[6], word=(6, 7))
+            return label, fields, True
 
         if sub_op == 1:  # TILED (L2T broadcast/frame-to-field, or plain)
             if header_dw & (3 << 26):
                 f2f = bool(header_dw & (1 << 26))
-                emit(f"Copy Packet Fields ({'L2T_FRAME_TO_FIELD' if f2f else 'L2T_BROADCAST'}):")
+                label = f"COPY ({'L2T_FRAME_TO_FIELD' if f2f else 'L2T_BROADCAST'})"
                 dec("ENCRYPT", (header_dw >> 16) & 0x1)
                 dec("TMZ", (header_dw >> 18) & 0x1)
                 dec("MIP_MAX", (header_dw >> 20) & 0xF)
                 dec("VIDEOCOPY", (header_dw >> 26) & 0x1)
                 dec("BROADCAST", (header_dw >> 27) & 0x1)
-                hx("TILED_ADDR0", (words[1] << 32) | words[0])
-                hx("TILED_ADDR1", (words[3] << 32) | words[2])
-                dec("WIDTH", words[4] & 0x3FFF)
-                dec("HEIGHT", words[5] & 0x3FFF)
-                dec("DEPTH", (words[5] >> 16) & 0x1FFF)
-                dec("ELEMENT_SIZE", words[6] & 0x7)
-                dec("SWIZZLE_MODE", (words[6] >> 3) & 0x1F)
-                dec("DIMENSION", (words[6] >> 9) & 0x3)
-                dec("EPITCH", (words[6] >> 16) & 0xFFFF)
-                dec("X", words[7] & 0x3FFF)
-                dec("Y", (words[7] >> 16) & 0x3FFF)
-                dec("Z", words[8] & 0x7FF)
-                dec("DST2_SW", (words[9] >> 8) & 0x3)
-                dec("DST2_CACHE_POLICY", (words[9] >> 10) & 0x7)
-                dec("LINEAR_SW", (words[9] >> 16) & 0x3)
-                dec("LINEAR_CACHE_POLICY", (words[9] >> 18) & 0x7)
-                dec("TILE_SW", (words[9] >> 24) & 0x3)
-                dec("TILE_CACHE_POLICY", (words[9] >> 26) & 0x7)
-                hx("LINEAR_ADDR", (words[11] << 32) | words[10])
-                dec("LINEAR_PITCH", words[12] & 0x7FFFF)
-                dec("LINEAR_SLICE_PITCH", words[13])
-                dec("COUNT", words[14] & 0x3FFFFF)
+                hx("TILED_ADDR0", (words[1] << 32) | words[0], word=(0, 1))
+                hx("TILED_ADDR1", (words[3] << 32) | words[2], word=(2, 3))
+                dec("WIDTH", words[4] & 0x3FFF, word=4)
+                dec("HEIGHT", words[5] & 0x3FFF, word=5)
+                dec("DEPTH", (words[5] >> 16) & 0x1FFF, word=5)
+                dec("ELEMENT_SIZE", words[6] & 0x7, word=6)
+                dec("SWIZZLE_MODE", (words[6] >> 3) & 0x1F, word=6)
+                dec("DIMENSION", (words[6] >> 9) & 0x3, word=6)
+                dec("EPITCH", (words[6] >> 16) & 0xFFFF, word=6)
+                dec("X", words[7] & 0x3FFF, word=7)
+                dec("Y", (words[7] >> 16) & 0x3FFF, word=7)
+                dec("Z", words[8] & 0x7FF, word=8)
+                dec("DST2_SW", (words[9] >> 8) & 0x3, word=9)
+                dec("DST2_CACHE_POLICY", (words[9] >> 10) & 0x7, word=9)
+                dec("LINEAR_SW", (words[9] >> 16) & 0x3, word=9)
+                dec("LINEAR_CACHE_POLICY", (words[9] >> 18) & 0x7, word=9)
+                dec("TILE_SW", (words[9] >> 24) & 0x3, word=9)
+                dec("TILE_CACHE_POLICY", (words[9] >> 26) & 0x7, word=9)
+                hx("LINEAR_ADDR", (words[11] << 32) | words[10], word=(10, 11))
+                dec("LINEAR_PITCH", words[12] & 0x7FFFF, word=12)
+                dec("LINEAR_SLICE_PITCH", words[13], word=13)
+                dec("COUNT", words[14] & 0x3FFFFF, word=14)
             else:
-                emit("Copy Packet Fields (TILED):")
+                label = "COPY (TILED)"
                 dec("ENCRYPT", (header_dw >> 16) & 0x1)
                 dec("TMZ", (header_dw >> 18) & 0x1)
                 dec("MIP_MAX", (header_dw >> 20) & 0xF)
                 dec("VIDEOCOPY", (header_dw >> 26) & 0x1)
                 dec("BROADCAST", (header_dw >> 27) & 0x1)
                 dec("DETILE", (header_dw >> 31) & 0x1)
-                hx("TILED_ADDR", (words[1] << 32) | words[0])
-                dec("WIDTH", words[2] & 0x3FFF)
-                dec("HEIGHT", words[3] & 0x3FFF)
-                dec("DEPTH", (words[3] >> 16) & 0x1FFF)
-                dec("ELEMENT_SIZE", words[4] & 0x7)
-                dec("SWIZZLE_MODE", (words[4] >> 3) & 0x1F)
-                dec("DIMENSION", (words[4] >> 9) & 0x3)
-                dec("EPITCH", (words[4] >> 16) & 0xFFFF)
-                dec("X", words[5] & 0x3FFF)
-                dec("Y", (words[5] >> 16) & 0x3FFF)
-                dec("Z", words[6] & 0x1FFF)
-                dec("LINEAR_SW", (words[6] >> 16) & 0x3)
-                dec("LINEAR_CACHE_POLICY", (words[6] >> 18) & 0x7)
-                dec("TILE_SW", (words[6] >> 24) & 0x3)
-                dec("TILE_CACHE_POLICY", (words[6] >> 26) & 0x7)
-                hx("LINEAR_ADDR", (words[8] << 32) | words[7])
-                dec("LINEAR_PITCH", words[9] & 0x7FFFF)
-                dec("LINEAR_SLICE_PITCH", words[10])
-                dec("COUNT", words[11] & 0x3FFFFFFF)
-            return True
+                hx("TILED_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+                dec("WIDTH", words[2] & 0x3FFF, word=2)
+                dec("HEIGHT", words[3] & 0x3FFF, word=3)
+                dec("DEPTH", (words[3] >> 16) & 0x1FFF, word=3)
+                dec("ELEMENT_SIZE", words[4] & 0x7, word=4)
+                dec("SWIZZLE_MODE", (words[4] >> 3) & 0x1F, word=4)
+                dec("DIMENSION", (words[4] >> 9) & 0x3, word=4)
+                dec("EPITCH", (words[4] >> 16) & 0xFFFF, word=4)
+                dec("X", words[5] & 0x3FFF, word=5)
+                dec("Y", (words[5] >> 16) & 0x3FFF, word=5)
+                dec("Z", words[6] & 0x1FFF, word=6)
+                dec("LINEAR_SW", (words[6] >> 16) & 0x3, word=6)
+                dec("LINEAR_CACHE_POLICY", (words[6] >> 18) & 0x7, word=6)
+                dec("TILE_SW", (words[6] >> 24) & 0x3, word=6)
+                dec("TILE_CACHE_POLICY", (words[6] >> 26) & 0x7, word=6)
+                hx("LINEAR_ADDR", (words[8] << 32) | words[7], word=(7, 8))
+                dec("LINEAR_PITCH", words[9] & 0x7FFFF, word=9)
+                dec("LINEAR_SLICE_PITCH", words[10], word=10)
+                dec("COUNT", words[11] & 0x3FFFFFFF, word=11)
+            return label, fields, True
 
         if sub_op == 3:  # STRUCTURE/SOA
-            emit("Copy Packet Fields (STRUCT):")
+            label = "COPY (STRUCT)"
             dec("TMZ", (header_dw >> 18) & 0x1)
             dec("DETILE", (header_dw >> 31) & 0x1)
-            hx("SB_ADDR", (words[1] << 32) | words[0])
-            dec("START_INDEX", words[2])
-            dec("COUNT", words[3])
-            dec("STRIDE", words[4] & 0x7FF)
-            dec("LINEAR_SW", (words[4] >> 16) & 0x3)
-            dec("LINEAR_CACHE_POLICY", (words[4] >> 18) & 0x7)
-            dec("STRUCT_SW", (words[4] >> 24) & 0x3)
-            dec("STRUCT_CACHE_POLICY", (words[4] >> 26) & 0x7)
-            hx("LINEAR_ADDR", (words[6] << 32) | words[5])
-            return True
+            hx("SB_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("START_INDEX", words[2], word=2)
+            dec("COUNT", words[3], word=3)
+            dec("STRIDE", words[4] & 0x7FF, word=4)
+            dec("LINEAR_SW", (words[4] >> 16) & 0x3, word=4)
+            dec("LINEAR_CACHE_POLICY", (words[4] >> 18) & 0x7, word=4)
+            dec("STRUCT_SW", (words[4] >> 24) & 0x3, word=4)
+            dec("STRUCT_CACHE_POLICY", (words[4] >> 26) & 0x7, word=4)
+            hx("LINEAR_ADDR", (words[6] << 32) | words[5], word=(5, 6))
+            return label, fields, True
 
         if sub_op == 4:  # LINEAR_SUB_WINDOW
-            emit("Copy Packet Fields (LINEAR_SUB_WINDOW):")
+            label = "COPY (LINEAR_SUB_WINDOW)"
             dec("TMZ", (header_dw >> 18) & 0x1)
             dec("ELEMENTSIZE", (header_dw >> 29) & 0x7)
-            hx("SRC_ADDR", (words[1] << 32) | words[0])
-            dec("SRC_X", words[2] & 0x3FFF)
-            dec("SRC_Y", (words[2] >> 16) & 0x3FFF)
-            dec("SRC_Z", words[3] & z_mask)
-            dec("SRC_PITCH", (words[3] >> pitch_shift) & pitch_mask)
-            dec("SRC_SLICE_PITCH", words[4] & 0xFFFFFFF)
-            hx("DST_ADDR", (words[6] << 32) | words[5])
-            dec("DST_X", words[7] & 0x3FFF)
-            dec("DST_Y", (words[7] >> 16) & 0x3FFF)
-            dec("DST_Z", words[8] & z_mask)
-            dec("DST_PITCH", (words[8] >> pitch_shift) & pitch_mask)
-            dec("DST_SLICE_PITCH", words[9] & 0xFFFFFFF)
-            dec("RECT_X", words[10] & 0x3FFF)
-            dec("RECT_Y", (words[10] >> 16) & 0x3FFF)
-            dec("RECT_Z", words[11] & 0x1FFF)
-            dec("DST_SW", (words[11] >> 16) & 0x3)
-            dec("DST_CACHE_POLICY", (words[11] >> 18) & 0x7)
-            dec("SRC_SW", (words[11] >> 24) & 0x3)
-            dec("SRC_CACHE_POLICY", (words[11] >> 26) & 0x7)
-            return True
+            hx("SRC_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("SRC_X", words[2] & 0x3FFF, word=2)
+            dec("SRC_Y", (words[2] >> 16) & 0x3FFF, word=2)
+            dec("SRC_Z", words[3] & z_mask, word=3)
+            dec("SRC_PITCH", (words[3] >> pitch_shift) & pitch_mask, word=3)
+            dec("SRC_SLICE_PITCH", words[4] & 0xFFFFFFF, word=4)
+            hx("DST_ADDR", (words[6] << 32) | words[5], word=(5, 6))
+            dec("DST_X", words[7] & 0x3FFF, word=7)
+            dec("DST_Y", (words[7] >> 16) & 0x3FFF, word=7)
+            dec("DST_Z", words[8] & z_mask, word=8)
+            dec("DST_PITCH", (words[8] >> pitch_shift) & pitch_mask, word=8)
+            dec("DST_SLICE_PITCH", words[9] & 0xFFFFFFF, word=9)
+            dec("RECT_X", words[10] & 0x3FFF, word=10)
+            dec("RECT_Y", (words[10] >> 16) & 0x3FFF, word=10)
+            dec("RECT_Z", words[11] & 0x1FFF, word=11)
+            dec("DST_SW", (words[11] >> 16) & 0x3, word=11)
+            dec("DST_CACHE_POLICY", (words[11] >> 18) & 0x7, word=11)
+            dec("SRC_SW", (words[11] >> 24) & 0x3, word=11)
+            dec("SRC_CACHE_POLICY", (words[11] >> 26) & 0x7, word=11)
+            return label, fields, True
 
         if sub_op == 5:  # TILED_SUB_WINDOW
-            emit("Copy Packet Fields (TILED_SUB_WINDOW):")
+            label = "COPY (TILED_SUB_WINDOW)"
             dec("TMZ", (header_dw >> 18) & 0x1)
-            dec("MIP_MAX", (words[0] >> 20) & 0xF)
-            dec("MIP_ID", (words[0] >> 24) & 0xF)
+            dec("MIP_MAX", (words[0] >> 20) & 0xF, word=0)
+            dec("MIP_ID", (words[0] >> 24) & 0xF, word=0)
             dec("DETILE", header_dw >> 31)
-            hx("TILED_ADDR", (words[1] << 32) | words[0])
-            dec("TILED_X", words[2] & 0x3FFF)
-            dec("TILED_Y", (words[2] >> 16) & 0x3FFF)
-            dec("TILED_Z", words[3] & z_mask)
-            dec("WIDTH", (words[3] >> 16) & 0x3FFF)
-            dec("HEIGHT", words[4] & 0x3FFF)
-            dec("DEPTH", (words[4] >> 16) & z_mask)
-            dec("ELEMENT_SIZE", words[5] & 0x7)
-            dec("SWIZZLE_MODE", (words[5] >> 3) & 0x1F)
-            dec("DIMENSION", (words[5] >> 9) & 0x3)
-            dec("EPITCH", (words[5] >> 16) & 0xFFFF)
-            hx("LINEAR_ADDR", (words[7] << 32) | words[6])
-            dec("LINEAR_X", words[8] & 0x3FFF)
-            dec("LINEAR_Y", words[8] & 0x3FFF)
-            dec("LINEAR_Z", words[9] & z_mask)
-            dec("LINEAR_PITCH", (words[9] >> 16) & 0x3FFF)
-            dec("LINEAR_SLICE_PITCH", words[10] & 0xFFFFFFF)
-            dec("RECT_X", words[11] & 0x3FFF)
-            dec("RECT_Y", (words[11] >> 16) & 0x3FFF)
-            dec("RECT_Z", words[12] & z_mask)
-            dec("LINEAR_SW", (words[12] >> 16) & 0x3)
-            dec("LINEAR_CACHE_POLICY", (words[12] >> 18) & 0x7)
-            return True
+            hx("TILED_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("TILED_X", words[2] & 0x3FFF, word=2)
+            dec("TILED_Y", (words[2] >> 16) & 0x3FFF, word=2)
+            dec("TILED_Z", words[3] & z_mask, word=3)
+            dec("WIDTH", (words[3] >> 16) & 0x3FFF, word=3)
+            dec("HEIGHT", words[4] & 0x3FFF, word=4)
+            dec("DEPTH", (words[4] >> 16) & z_mask, word=4)
+            dec("ELEMENT_SIZE", words[5] & 0x7, word=5)
+            dec("SWIZZLE_MODE", (words[5] >> 3) & 0x1F, word=5)
+            dec("DIMENSION", (words[5] >> 9) & 0x3, word=5)
+            dec("EPITCH", (words[5] >> 16) & 0xFFFF, word=5)
+            hx("LINEAR_ADDR", (words[7] << 32) | words[6], word=(6, 7))
+            dec("LINEAR_X", words[8] & 0x3FFF, word=8)
+            dec("LINEAR_Y", words[8] & 0x3FFF, word=8)
+            dec("LINEAR_Z", words[9] & z_mask, word=9)
+            dec("LINEAR_PITCH", (words[9] >> 16) & 0x3FFF, word=9)
+            dec("LINEAR_SLICE_PITCH", words[10] & 0xFFFFFFF, word=10)
+            dec("RECT_X", words[11] & 0x3FFF, word=11)
+            dec("RECT_Y", (words[11] >> 16) & 0x3FFF, word=11)
+            dec("RECT_Z", words[12] & z_mask, word=12)
+            dec("LINEAR_SW", (words[12] >> 16) & 0x3, word=12)
+            dec("LINEAR_CACHE_POLICY", (words[12] >> 18) & 0x7, word=12)
+            return label, fields, True
 
         if sub_op == 6:  # T2T_SUB_WINDOW
-            emit("Copy Packet Fields (T2T_SUB_WINDOW):")
+            label = "COPY (T2T_SUB_WINDOW)"
             dec("TMZ", (header_dw >> 18) & 0x1)
             dec("MIP_MAX", (header_dw >> 20) & 0xF)
-            hx("SRC_ADDR", (words[1] << 32) | words[0])
-            dec("SRC_X", words[2] & 0x3FFF)
-            dec("SRC_Y", (words[2] >> 16) & 0x3FFF)
-            dec("SRC_Z", words[3] & z_mask)
-            dec("SRC_WIDTH", (words[3] >> 16) & 0x3FFF)
-            dec("SRC_HEIGHT", words[4] & 0x3FFF)
-            dec("SRC_DEPTH", (words[4] >> 16) & z_mask)
-            dec("SRC_ELEMENT_SIZE", words[5] & 0x7)
-            dec("SRC_SWIZZLE_MODE", (words[5] >> 3) & 0x1F)
-            dec("SRC_DIMENSION", (words[5] >> 9) & 0x3)
-            dec("SRC_EPITCH", (words[5] >> 16) & 0xFFFF)
-            hx("DST_ADDR", (words[7] << 32) | words[6])
-            dec("DST_X", words[8] & 0x3FFF)
-            dec("DST_Y", (words[8] >> 16) & 0x3FFF)
-            dec("DST_Z", words[9] & z_mask)
-            dec("DST_WIDTH", (words[9] >> 16) & 0x3FFF)
-            dec("DST_HEIGHT", words[10] & 0x3FFF)
-            dec("DST_DEPTH", (words[10] >> 16) & z_mask)
-            dec("DST_ELEMENT_SIZE", words[11] & 0x7)
-            dec("DST_SWIZZLE_MODE", (words[11] >> 3) & 0x1F)
-            dec("DST_DIMENSION", (words[11] >> 9) & 0x3)
-            dec("DST_EPITCH", (words[11] >> 16) & 0xFFFF)
-            dec("RECT_X", words[12] & 0x3FFF)
-            dec("RECT_Y", (words[12] >> 16) & 0x3FFF)
-            dec("RECT_Z", words[13] & z_mask)
-            dec("DST_SW", (words[13] >> 16) & 0x3)
-            dec("DST_CACHE_POLICY", (words[13] >> 18) & 0x7)
-            dec("SRC_SW", (words[13] >> 22) & 0x3)
-            dec("SRC_CACHE_POLICY", (words[13] >> 26) & 0x7)
-            return True
+            hx("SRC_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("SRC_X", words[2] & 0x3FFF, word=2)
+            dec("SRC_Y", (words[2] >> 16) & 0x3FFF, word=2)
+            dec("SRC_Z", words[3] & z_mask, word=3)
+            dec("SRC_WIDTH", (words[3] >> 16) & 0x3FFF, word=3)
+            dec("SRC_HEIGHT", words[4] & 0x3FFF, word=4)
+            dec("SRC_DEPTH", (words[4] >> 16) & z_mask, word=4)
+            dec("SRC_ELEMENT_SIZE", words[5] & 0x7, word=5)
+            dec("SRC_SWIZZLE_MODE", (words[5] >> 3) & 0x1F, word=5)
+            dec("SRC_DIMENSION", (words[5] >> 9) & 0x3, word=5)
+            dec("SRC_EPITCH", (words[5] >> 16) & 0xFFFF, word=5)
+            hx("DST_ADDR", (words[7] << 32) | words[6], word=(6, 7))
+            dec("DST_X", words[8] & 0x3FFF, word=8)
+            dec("DST_Y", (words[8] >> 16) & 0x3FFF, word=8)
+            dec("DST_Z", words[9] & z_mask, word=9)
+            dec("DST_WIDTH", (words[9] >> 16) & 0x3FFF, word=9)
+            dec("DST_HEIGHT", words[10] & 0x3FFF, word=10)
+            dec("DST_DEPTH", (words[10] >> 16) & z_mask, word=10)
+            dec("DST_ELEMENT_SIZE", words[11] & 0x7, word=11)
+            dec("DST_SWIZZLE_MODE", (words[11] >> 3) & 0x1F, word=11)
+            dec("DST_DIMENSION", (words[11] >> 9) & 0x3, word=11)
+            dec("DST_EPITCH", (words[11] >> 16) & 0xFFFF, word=11)
+            dec("RECT_X", words[12] & 0x3FFF, word=12)
+            dec("RECT_Y", (words[12] >> 16) & 0x3FFF, word=12)
+            dec("RECT_Z", words[13] & z_mask, word=13)
+            dec("DST_SW", (words[13] >> 16) & 0x3, word=13)
+            dec("DST_CACHE_POLICY", (words[13] >> 18) & 0x7, word=13)
+            dec("SRC_SW", (words[13] >> 22) & 0x3, word=13)
+            dec("SRC_CACHE_POLICY", (words[13] >> 26) & 0x7, word=13)
+            return label, fields, True
 
         if sub_op == 7:  # DIRTY_PAGE
-            emit("Copy Packet Fields (DIRTY_PAGE):")
+            label = "COPY (DIRTY_PAGE)"
             dec("TMZ", (header_dw >> 18) & 0x1)
             dec("ALL", (header_dw >> 31) & 0x1)
-            dec("COUNT", words[0] & 0x3FFFFF)
-            dec("DST_CACHE_POLICY", (words[1] >> 5) & 0x3)
-            dec("SRC_CACHE_POLICY", (words[1] >> 13) & 0x3)
-            dec("DST_SW", (words[1] >> 16) & 0x3)
-            dec("DST_GCC", (words[1] >> 19) & 0x1)
-            dec("DST_SYS", (words[1] >> 20) & 0x1)
-            dec("DST_SNOOP", (words[1] >> 22) & 0x1)
-            dec("DST_GPA", (words[1] >> 23) & 0x1)
-            dec("SRC_SW", (words[1] >> 24) & 0x3)
-            dec("SRC_SYS", (words[1] >> 28) & 0x1)
-            dec("SRC_SNOOP", (words[1] >> 30) & 0x1)
-            dec("SRC_GPA", (words[1] >> 31) & 0x1)
-            hx("SRC_ADDR", (words[3] << 32) | words[2])
-            hx("DST_ADDR", (words[5] << 32) | words[4])
-            return True
+            dec("COUNT", words[0] & 0x3FFFFF, word=0)
+            dec("DST_CACHE_POLICY", (words[1] >> 5) & 0x3, word=1)
+            dec("SRC_CACHE_POLICY", (words[1] >> 13) & 0x3, word=1)
+            dec("DST_SW", (words[1] >> 16) & 0x3, word=1)
+            dec("DST_GCC", (words[1] >> 19) & 0x1, word=1)
+            dec("DST_SYS", (words[1] >> 20) & 0x1, word=1)
+            dec("DST_SNOOP", (words[1] >> 22) & 0x1, word=1)
+            dec("DST_GPA", (words[1] >> 23) & 0x1, word=1)
+            dec("SRC_SW", (words[1] >> 24) & 0x3, word=1)
+            dec("SRC_SYS", (words[1] >> 28) & 0x1, word=1)
+            dec("SRC_SNOOP", (words[1] >> 30) & 0x1, word=1)
+            dec("SRC_GPA", (words[1] >> 31) & 0x1, word=1)
+            hx("SRC_ADDR", (words[3] << 32) | words[2], word=(2, 3))
+            hx("DST_ADDR", (words[5] << 32) | words[4], word=(4, 5))
+            return label, fields, True
 
         if sub_op == 8:  # LINEAR_PHY
-            emit("Copy Packet Fields (LINEAR_PHY):")
+            label = "COPY (LINEAR_PHY)"
             dec("TMZ", (header_dw >> 18) & 0x1)
-            dec("COUNT", words[0] & 0x3FFFFF)
-            dec("DST_CACHE_POLICY", (words[1] >> 5) & 0x3)
-            dec("SRC_CACHE_POLICY", (words[1] >> 13) & 0x3)
-            dec("DST_SW", (words[1] >> 16) & 0x3)
-            dec("DST_GCC", (words[1] >> 19) & 0x1)
-            dec("DST_SYS", (words[1] >> 20) & 0x1)
-            dec("DST_LOG", (words[1] >> 21) & 0x1)
-            dec("DST_SNOOP", (words[1] >> 22) & 0x1)
-            dec("DST_GPA", (words[1] >> 23) & 0x1)
-            dec("SRC_SW", (words[1] >> 24) & 0x3)
-            dec("SRC_GCC", (words[1] >> 27) & 0x1)
-            dec("SRC_SYS", (words[1] >> 28) & 0x1)
-            dec("SRC_SNOOP", (words[1] >> 30) & 0x1)
-            dec("SRC_GPA", (words[1] >> 31) & 0x1)
+            dec("COUNT", words[0] & 0x3FFFFF, word=0)
+            dec("DST_CACHE_POLICY", (words[1] >> 5) & 0x3, word=1)
+            dec("SRC_CACHE_POLICY", (words[1] >> 13) & 0x3, word=1)
+            dec("DST_SW", (words[1] >> 16) & 0x3, word=1)
+            dec("DST_GCC", (words[1] >> 19) & 0x1, word=1)
+            dec("DST_SYS", (words[1] >> 20) & 0x1, word=1)
+            dec("DST_LOG", (words[1] >> 21) & 0x1, word=1)
+            dec("DST_SNOOP", (words[1] >> 22) & 0x1, word=1)
+            dec("DST_GPA", (words[1] >> 23) & 0x1, word=1)
+            dec("SRC_SW", (words[1] >> 24) & 0x3, word=1)
+            dec("SRC_GCC", (words[1] >> 27) & 0x1, word=1)
+            dec("SRC_SYS", (words[1] >> 28) & 0x1, word=1)
+            dec("SRC_SNOOP", (words[1] >> 30) & 0x1, word=1)
+            dec("SRC_GPA", (words[1] >> 31) & 0x1, word=1)
             n = 2
             idx = 0
             while n + 3 < len(words):
-                hx(f"SRC_ADDR{idx}", (words[n + 1] << 32) | words[n])
-                hx(f"DST_ADDR{idx}", (words[n + 3] << 32) | words[n + 2])
+                hx(f"SRC_ADDR{idx}", (words[n + 1] << 32) | words[n], word=(n, n + 1))
+                hx(f"DST_ADDR{idx}", (words[n + 3] << 32) | words[n + 2], word=(n + 2, n + 3))
                 n += 4
                 idx += 1
-            return True
+            return label, fields, True
 
-        return False  # 16/17/20/21/22/36 -- legacy _BC variants, see docstring
+        return None, fields, False  # 16/17/20/21/22/36 -- legacy _BC variants, see docstring
 
     if op == 2:  # WRITE
         if sub_op == 0:  # LINEAR
-            emit("Write Packet Fields (LINEAR):")
+            label = "WRITE (LINEAR)"
             dec("ENCRYPT", (header_dw >> 16) & 0x1)
             dec("TMZ", (header_dw >> 18) & 0x1)
-            hx("DST_ADDR", (words[1] << 32) | words[0])
-            dec("COUNT", words[2])
-            dec("SWAP", (words[2] >> 24) & 0x3)
-            dec("CACHE_POLICY", (words[2] >> 26) & 0x7)
+            hx("DST_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("COUNT", words[2], word=2)
+            dec("SWAP", (words[2] >> 24) & 0x3, word=2)
+            dec("CACHE_POLICY", (words[2] >> 26) & 0x7, word=2)
             for n in range(3, len(words)):
-                hx(f"DATA_{n - 3}", words[n])
-            return True
+                hx(f"DATA_{n - 3}", words[n], word=n)
+            return label, fields, True
 
         if sub_op == 1:  # TILED
-            emit("Write Packet Fields (TILED):")
+            label = "WRITE (TILED)"
             dec("ENCRYPT", (header_dw >> 16) & 0x1)
             dec("TMZ", (header_dw >> 18) & 0x1)
-            hx("DST_ADDR", (words[1] << 32) | words[0])
-            dec("WIDTH", (words[2] >> 16) & 0x3FFF)
-            dec("HEIGHT", words[3] & 0x3FFF)
-            dec("DEPTH", (words[3] >> 16) & z_mask)
-            dec("ELEMENT_SIZE", words[4] & 0x7)
-            dec("SWIZZLE_MODE", (words[4] >> 3) & 0x1F)
-            dec("DIMENSION", (words[4] >> 9) & 0x3)
-            dec("EPITCH", (words[4] >> 16) & 0xFFFF)
-            dec("X", words[5] & 0x3FFF)
-            dec("Y", (words[5] >> 16) & 0x3FFF)
-            dec("Z", words[6] & z_mask)
-            dec("SW", (words[6] >> 24) & 0x3)
-            dec("CACHE_POLICY", (words[6] >> 26) & 0x7)
-            dec("COUNT", words[7] & 0xFFFFF)
+            hx("DST_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("WIDTH", (words[2] >> 16) & 0x3FFF, word=2)
+            dec("HEIGHT", words[3] & 0x3FFF, word=3)
+            dec("DEPTH", (words[3] >> 16) & z_mask, word=3)
+            dec("ELEMENT_SIZE", words[4] & 0x7, word=4)
+            dec("SWIZZLE_MODE", (words[4] >> 3) & 0x1F, word=4)
+            dec("DIMENSION", (words[4] >> 9) & 0x3, word=4)
+            dec("EPITCH", (words[4] >> 16) & 0xFFFF, word=4)
+            dec("X", words[5] & 0x3FFF, word=5)
+            dec("Y", (words[5] >> 16) & 0x3FFF, word=5)
+            dec("Z", words[6] & z_mask, word=6)
+            dec("SW", (words[6] >> 24) & 0x3, word=6)
+            dec("CACHE_POLICY", (words[6] >> 26) & 0x7, word=6)
+            dec("COUNT", words[7] & 0xFFFFF, word=7)
             for n in range(8, len(words)):
-                hx(f"DATA_{n - 8}", words[n])
-            return True
+                hx(f"DATA_{n - 8}", words[n], word=n)
+            return label, fields, True
 
-        return False  # 17 (TILED_BC) -- legacy, see docstring
+        return None, fields, False  # 17 (TILED_BC) -- legacy, see docstring
 
     if op == 4:  # INDIRECT -- see module docstring re: this deviation
-        emit("Indirect Buffer Packet Fields:")
+        label = "INDIRECT_BUFFER"
         dec("VMID", (header_dw >> 16) & 0xF)
         dec("PRIV", (header_dw >> 31) & 0x1)
-        hx("IB_ADDR", (words[1] << 32) | words[0])
-        dec("IB_SIZE", words[2])
+        hx("IB_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+        dec("IB_SIZE", words[2], word=2)
         if len(words) > 4:
-            hx("IB_CSA_ADDR", (words[4] << 32) | words[3])
-        return True
+            hx("IB_CSA_ADDR", (words[4] << 32) | words[3], word=(3, 4))
+        return label, fields, True
 
     if op == 5:  # FENCE
-        emit("Fence Packet Fields:")
+        label = "FENCE"
         dec("L2_POLICY", (header_dw >> 24) & 0x3)
         dec("LLC_POLICY", (header_dw >> 26) & 0x1)
-        hx("FENCE_ADDR", (words[1] << 32) | words[0])
-        dec("FENCE_DATA", words[2])
-        return True
+        hx("FENCE_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+        dec("FENCE_DATA", words[2], word=2)
+        return label, fields, True
 
     if op == 6:  # TRAP -- kept beyond decode_upto_ai's own coverage, see docstring
-        emit("Trap Packet Fields:")
-        hx("TRAP_INT_CONTEXT", words[0] & 0xFFFFFF)
-        return True
+        label = "TRAP"
+        hx("TRAP_INT_CONTEXT", words[0] & 0xFFFFFF, word=0)
+        return label, fields, True
 
     if op == 7:  # SEM / MEM_INCR
         if sub_op == 0:  # SEM
-            emit("Sem Packet Fields:")
+            label = "SEM"
             dec("WRITE_ONE", (header_dw >> 29) & 1)
             dec("SIGNAL", (header_dw >> 30) & 1)
             dec("MAILBOX", (header_dw >> 31) & 1)
-            hx("SEMAPHORE_ADDR", (words[1] << 32) | words[0])
-            return True
+            hx("SEMAPHORE_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            return label, fields, True
         if sub_op == 1:  # MEM_INCR
-            emit("Sem Packet Fields (MEM_INCR):")
+            label = "SEM (MEM_INCR)"
             dec("L2_POLICY", (header_dw >> 24) & 0x3)
             dec("LLC_POLICY", (header_dw >> 26) & 0x1)
-            hx("ADDR", (words[1] << 32) | words[0])
-            return True
-        return False
+            hx("ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            return label, fields, True
+        return None, fields, False
 
     if op == 8:  # POLL_REGMEM
         if sub_op == 0:  # POLL_REGMEM (register or memory)
-            emit("Poll Packet Fields:")
+            label = "POLL_REGMEM"
             dec("CACHE_POLICY", (header_dw >> 20) & 0x7)
             dec("HDP_FLUSH", (header_dw >> 26) & 1)
-            emit(f"  FUNCTION={_POLL_REGMEM_FUNCS[(header_dw >> 28) & 7]}")
+            fields.append((None, "FUNCTION", _POLL_REGMEM_FUNCS[(header_dw >> 28) & 7]))
             mem_poll = bool(header_dw & (1 << 31))
             dec("MEM_POLL", int(mem_poll))
             if not mem_poll:
-                hx("REGISTER", (words[0] >> 2) & 0x3FFFF)
+                hx("REGISTER", (words[0] >> 2) & 0x3FFFF, word=0)
                 if ((header_dw >> 26) & 3) == 1:  # HDP_FLUSH provides a write register
-                    hx("REGISTER", (words[1] >> 2) & 0xFFFF)
+                    hx("REGISTER", (words[1] >> 2) & 0xFFFF, word=1)
                 else:
-                    hx("RESERVED", words[1])
+                    hx("RESERVED", words[1], word=1)
             else:
-                hx("POLL_REGMEM_ADDR", (words[1] << 32) | words[0])
-            hx("VALUE", words[2])
-            hx("MASK", words[3])
-            dec("INTERVAL", words[4] & 0xFFFF)
-            dec("RETRY_COUNT", (words[4] >> 16) & 0xFFF)
-            return True
+                hx("POLL_REGMEM_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            hx("VALUE", words[2], word=2)
+            hx("MASK", words[3], word=3)
+            dec("INTERVAL", words[4] & 0xFFFF, word=4)
+            dec("RETRY_COUNT", (words[4] >> 16) & 0xFFF, word=4)
+            return label, fields, True
         if sub_op == 1:  # POLL_REG_WRITE_MEM
-            emit("Poll Packet Fields (POLL_REG_WRITE_MEM):")
+            label = "POLL_REG_WRITE_MEM"
             dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
-            hx("SRC_ADDR", words[0])
-            hx("DST_ADDR", (words[2] << 32) | words[1])
-            return True
+            hx("SRC_ADDR", words[0], word=0)
+            hx("DST_ADDR", (words[2] << 32) | words[1], word=(1, 2))
+            return label, fields, True
         if sub_op == 2:  # POLL_DBIT_WRITE_MEM
-            emit("Poll Packet Fields (POLL_DBIT_WRITE_MEM):")
+            label = "POLL_DBIT_WRITE_MEM"
             dec("EA", (header_dw >> 16) & 0x3)
             dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
-            hx("DST_ADDR", (words[1] << 32) | words[0])
-            dec("START_PAGE", (words[2] >> 4) & 0xFFFFFFF)
-            dec("PAGE_NUM", words[3])
-            return True
+            hx("DST_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            dec("START_PAGE", (words[2] >> 4) & 0xFFFFFFF, word=2)
+            dec("PAGE_NUM", words[3], word=3)
+            return label, fields, True
         if sub_op == 3:  # MEM_VERIFY
-            emit("Poll Packet Fields (MEM_VERIFY):")
+            label = "MEM_VERIFY"
             dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
             dec("MODE", (header_dw >> 31) & 0x1)
-            hx("PATTERN", words[0])
-            hx("CMP0_ADDR_START", (words[2] << 32) | words[1])
-            hx("CMP0_ADDR_END", (words[4] << 32) | words[3])
-            hx("CMP1_ADDR_START", (words[6] << 32) | words[5])
-            hx("CMP1_ADDR_END", (words[8] << 32) | words[7])
-            hx("REC_ADDR", (words[10] << 32) | words[9])
-            return True
+            hx("PATTERN", words[0], word=0)
+            hx("CMP0_ADDR_START", (words[2] << 32) | words[1], word=(1, 2))
+            hx("CMP0_ADDR_END", (words[4] << 32) | words[3], word=(3, 4))
+            hx("CMP1_ADDR_START", (words[6] << 32) | words[5], word=(5, 6))
+            hx("CMP1_ADDR_END", (words[8] << 32) | words[7], word=(7, 8))
+            hx("REC_ADDR", (words[10] << 32) | words[9], word=(9, 10))
+            return label, fields, True
         if sub_op == 4:  # INVALIDATION
-            emit("Poll Packet Fields (INVALIDATION):")
-            hx("INVALIDATEREQ", words[0])
-            hx("ADDRESSRANGE", words[1])
-            dec("INVALIDATEACK", words[2] & 0xFFFF)
-            dec("ADDRESSRANGE_HI", (words[2] >> 16) & 0x1F)
-            dec("INVALIDATEGFXHUB", (words[2] >> 21) & 0x1)
-            dec("INVALIDATEMMHUB", (words[2] >> 22) & 0x1)
-            return True
-        return False
+            label = "INVALIDATION"
+            hx("INVALIDATEREQ", words[0], word=0)
+            hx("ADDRESSRANGE", words[1], word=1)
+            dec("INVALIDATEACK", words[2] & 0xFFFF, word=2)
+            dec("ADDRESSRANGE_HI", (words[2] >> 16) & 0x1F, word=2)
+            dec("INVALIDATEGFXHUB", (words[2] >> 21) & 0x1, word=2)
+            dec("INVALIDATEMMHUB", (words[2] >> 22) & 0x1, word=2)
+            return label, fields, True
+        return None, fields, False
 
     if op == 9:  # COND_EXE
-        emit("Cond_Exe Packet Fields:")
+        label = "COND_EXE"
         dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
-        hx("ADDR", (words[1] << 32) | words[0])
-        dec("REFERENCE", words[2])
-        dec("EXEC_COUNT", words[3])
-        return True
+        hx("ADDR", (words[1] << 32) | words[0], word=(0, 1))
+        dec("REFERENCE", words[2], word=2)
+        dec("EXEC_COUNT", words[3], word=3)
+        return label, fields, True
 
     if op == 10:  # ATOMIC
-        emit("Atomic Packet Fields:")
+        label = "ATOMIC"
         dec("LOOP", (header_dw >> 16) & 1)
         dec("TMZ", (header_dw >> 18) & 0x1)
         dec("CACHE_POLICY", (header_dw >> 20) & 0x7)
         hx("OP", (header_dw >> 25) & 0x7F)
-        hx("ADDR", (words[1] << 32) | words[0])
-        hx("SRC_DATA", (words[3] << 32) | words[2])
-        hx("CMP_DATA", (words[5] << 32) | words[4])
-        dec("LOOP_INTERVAL", words[6] & 0x1FFF)
-        return True
+        hx("ADDR", (words[1] << 32) | words[0], word=(0, 1))
+        hx("SRC_DATA", (words[3] << 32) | words[2], word=(2, 3))
+        hx("CMP_DATA", (words[5] << 32) | words[4], word=(4, 5))
+        dec("LOOP_INTERVAL", words[6] & 0x1FFF, word=6)
+        return label, fields, True
 
     if op == 11:  # FILL
         if sub_op == 0:  # CONST_FILL
-            emit("Fill Packet Fields:")
+            label = "FILL"
             dec("SWAP", (header_dw >> 16) & 0x3)
             dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
             dec("FILL_SIZE", (header_dw >> 30) & 0x3)
-            hx("CONST_FILL_DST", (words[1] << 32) | words[0])
-            hx("CONST_FILL_DATA", words[2])
-            dec("CONST_FILL_BYTE_COUNT", words[3])
-            return True
+            hx("CONST_FILL_DST", (words[1] << 32) | words[0], word=(0, 1))
+            hx("CONST_FILL_DATA", words[2], word=2)
+            dec("CONST_FILL_BYTE_COUNT", words[3], word=3)
+            return label, fields, True
         if sub_op == 1:  # DATA_FILL_MULTI
-            emit("Fill Packet Fields (DATA_FILL_MULTI):")
+            label = "FILL (DATA_FILL_MULTI)"
             dec("MEMLOG_CLR", (header_dw >> 31) & 0x1)
-            dec("BYTE_STRIDE", words[0])
-            dec("DMA_COUNT", words[1])
-            hx("DST_ADDR", (words[3] << 32) | words[2])
-            dec("COUNT", words[4] & 0x3FFFFFF)
-            return True
-        return False
+            dec("BYTE_STRIDE", words[0], word=0)
+            dec("DMA_COUNT", words[1], word=1)
+            hx("DST_ADDR", (words[3] << 32) | words[2], word=(2, 3))
+            dec("COUNT", words[4] & 0x3FFFFFF, word=4)
+            return label, fields, True
+        return None, fields, False
 
     if op == 12:  # PTE
         if sub_op == 0:  # GEN_PTEPDE
-            emit("Pte Packet Fields (GEN_PTEPDE):")
-            hx("DST_ADDR", (words[1] << 32) | words[0])
+            label = "PTE (GEN_PTEPDE)"
+            hx("DST_ADDR", (words[1] << 32) | words[0], word=(0, 1))
             dec("CACHE_POLICY", (header_dw >> 24) & 0x7)
-            hx("MASK", (words[3] << 32) | words[2])
-            hx("INIT", (words[5] << 32) | words[4])
-            hx("INCR", (words[7] << 32) | words[6])
-            dec("COUNT", words[8] & 0x7FFFF)
-            return True
+            hx("MASK", (words[3] << 32) | words[2], word=(2, 3))
+            hx("INIT", (words[5] << 32) | words[4], word=(4, 5))
+            hx("INCR", (words[7] << 32) | words[6], word=(6, 7))
+            dec("COUNT", words[8] & 0x7FFFF, word=8)
+            return label, fields, True
         if sub_op == 1:  # COPY
-            emit("Pte Packet Fields (COPY):")
+            label = "PTE (COPY)"
             dec("TMZ", (header_dw >> 18) & 0x1)
             dec("PTEPDE_OP", (header_dw >> 31) & 0x1)
-            hx("SRC_ADDR", (words[1] << 32) | words[0])
-            hx("DST_ADDR", (words[3] << 32) | words[2])
-            hx("MASK", (words[5] << 32) | words[4])
-            dec("COUNT", words[6] & 0x7FFFF)
-            dec("DST_CACHE_POLICY", (words[6] >> 22) & 0x7)
-            dec("SRC_CACHE_POLICY", (words[6] >> 29) & 0x7)
-            return True
+            hx("SRC_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            hx("DST_ADDR", (words[3] << 32) | words[2], word=(2, 3))
+            hx("MASK", (words[5] << 32) | words[4], word=(4, 5))
+            dec("COUNT", words[6] & 0x7FFFF, word=6)
+            dec("DST_CACHE_POLICY", (words[6] >> 22) & 0x7, word=6)
+            dec("SRC_CACHE_POLICY", (words[6] >> 29) & 0x7, word=6)
+            return label, fields, True
         if sub_op == 2:  # RMW
-            emit("Pte Packet Fields (RMW):")
+            label = "PTE (RMW)"
             dec("MTYPE", (header_dw >> 16) & 0x7)
             dec("GCC", (header_dw >> 19) & 0x1)
             dec("SYS", (header_dw >> 20) & 0x1)
@@ -750,36 +764,97 @@ def _sdma_decode_fields(op, sub_op, header_dw, words, emit):
             dec("GPA", (header_dw >> 23) & 0x1)
             dec("L2_POLICY", (header_dw >> 24) & 0x3)
             dec("LLC_POLICY", (header_dw >> 26) & 0x1)
-            hx("ADDR", (words[1] << 32) | words[0])
-            hx("MASK", (words[3] << 32) | words[2])
-            hx("VALUE", (words[5] << 32) | words[4])
-            dec("NUM_OF_PTE", words[6])
-            return True
-        return False
+            hx("ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            hx("MASK", (words[3] << 32) | words[2], word=(2, 3))
+            hx("VALUE", (words[5] << 32) | words[4], word=(4, 5))
+            dec("NUM_OF_PTE", words[6], word=6)
+            return label, fields, True
+        return None, fields, False
 
     if op == 13:  # TIMESTAMP
         if sub_op == 0:  # SET
-            emit("Timestamp Packet Fields (SET):")
-            hx("INIT_DATA", (words[1] << 32) | words[0])
-            return True
+            label = "TIMESTAMP (SET)"
+            hx("INIT_DATA", (words[1] << 32) | words[0], word=(0, 1))
+            return label, fields, True
         if sub_op in (1, 2):  # GET / GET_GLOBAL
-            emit(f"Timestamp Packet Fields ({'GET_GLOBAL' if sub_op == 2 else 'GET'}):")
+            label = f"TIMESTAMP ({'GET_GLOBAL' if sub_op == 2 else 'GET'})"
             dec("L2_POLICY", (header_dw >> 24) & 0x3)
             dec("LLC_POLICY", (header_dw >> 26) & 0x1)
-            hx("WRITE_ADDR", (words[1] << 32) | words[0])
-            return True
-        return False
+            hx("WRITE_ADDR", (words[1] << 32) | words[0], word=(0, 1))
+            return label, fields, True
+        return None, fields, False
 
     if op == 14:  # SRBM_WRITE / RMW_REGISTER
         if sub_op == 0:  # SRBM_WRITE
-            emit("Srbm_Write Packet Fields:")
+            label = "SRBM_WRITE"
             dec("BYTE_ENABLE", header_dw >> 28)
-            hx("SRBM_WRITE_ADDR", words[0] & 0x3FFFF)
-            hx("SRBM_WRITE_DATA", words[1])
-            return True
-        return False  # RMW_REGISTER -- UMR itself doesn't decode this for AI
+            hx("SRBM_WRITE_ADDR", words[0] & 0x3FFFF, word=0)
+            hx("SRBM_WRITE_DATA", words[1], word=1)
+            return label, fields, True
+        return None, fields, False  # RMW_REGISTER -- UMR itself doesn't decode this for AI
 
-    return False  # SEM.default / PRE_EXE / GPUVM_TLB_INV / GCR -- not ported
+    return None, fields, False  # SEM.default / PRE_EXE / GPUVM_TLB_INV / GCR -- not ported
+
+
+_SDMA_LEFTCOL_WIDTH = 35  # width of the hex column (before "| "), confirmed with the user
+_SDMA_SEPARATOR_WIDTH = 84
+
+
+def _sdma_hex_bytes(dword):
+    return " ".join(f"{b:02x}" for b in struct.pack("<I", dword & 0xFFFFFFFF))
+
+
+def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size):
+    """Render one decoded SDMA packet in the two-column hex/field layout:
+    dword-grouped raw hex on the left (a bracket connects the two dwords of
+    a 64-bit LO/HI field), left-aligned "NAME = value" text on the right,
+    separated by "|". Fields sharing a dword show the hex only on their
+    first row; a dword pair spanning one field shows hex on both rows (no
+    "|" on the first) with the field text on the closing row. Packet type
+    is shown ALL CAPS at the top-right.
+    """
+    title = f"Packet #{i} at 0x{addr:x}"
+    type_label = label if label else f"OP=0x{op:x} SUB_OP=0x{sub_op:x}"
+    pad = max(1, _SDMA_SEPARATOR_WIDTH - 2 - len(title) - len(type_label))
+    emit("-" * _SDMA_SEPARATOR_WIDTH)
+    emit(f"{title}{' ' * pad}{type_label}")
+    emit("-" * _SDMA_SEPARATOR_WIDTH)
+
+    def row(left_text, field_text=None):
+        if field_text is None:
+            emit(left_text)  # hex-only row (e.g. bracket-open) -- no trailing pad
+        else:
+            emit(f"{left_text.ljust(_SDMA_LEFTCOL_WIDTH)}| {field_text}")
+
+    row(f"+0x00  {_sdma_hex_bytes(header_dw)}", f"HEADER op=0x{op:x} sub_op=0x{sub_op:x}")
+
+    idx = 0
+    n = len(fields)
+    while idx < n:
+        word_ref = fields[idx][0]
+        group = []
+        while idx < n and fields[idx][0] == word_ref:
+            group.append((fields[idx][1], fields[idx][2]))
+            idx += 1
+
+        if isinstance(word_ref, tuple):
+            lo, hi = word_ref
+            row(f"+0x{4 + 4 * lo:02x}  {_sdma_hex_bytes(words[lo])} ┌")
+            first_left = f"+0x{4 + 4 * hi:02x}  {_sdma_hex_bytes(words[hi])} ┘"
+        elif word_ref is None:
+            first_left = ""
+        else:
+            first_left = f"+0x{4 + 4 * word_ref:02x}  {_sdma_hex_bytes(words[word_ref])}"
+
+        name, value = group[0]
+        row(first_left, f"{name} = {value}")
+        for name, value in group[1:]:
+            row("", f"{name} = {value}")
+
+    if not decoded:
+        row("", f"(recognized, {size} bytes, not decoded in detail)")
+
+    emit("-" * _SDMA_SEPARATOR_WIDTH)
 
 
 def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
@@ -789,6 +864,7 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
     decode_upto_ai(), the generation confirmed for this host's real
     hardware (SDMA IP major 4) -- see _sdma_decode_fields()'s docstring for
     exactly what that covers and the two deliberate additions beyond it.
+    Rendered via _render_sdma_packet() as a two-column hex/field view.
 
     Stops early on a null (op==0, size-0) opcode, an unreadable/unknown
     byte, an opcode/sub-opcode this port doesn't recognize at all (can't
@@ -824,13 +900,12 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
             emit(f"Cannot read memory at 0x{addr:x}")
             break
 
-        emit("-" * 30)
         if nwords is None:
+            emit("-" * _SDMA_SEPARATOR_WIDTH)
             emit(f"Packet #{i} at 0x{addr:x}: op=0x{op:x} sub_op=0x{sub_op:x} (unrecognized opcode, stopping)")
             break
 
         size = 4 + nwords * 4
-        emit(f"Packet #{i} at 0x{addr:x}: op=0x{op:x} sub_op=0x{sub_op:x}")
 
         try:
             data = reader.read(addr, size)
@@ -840,12 +915,10 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
         words = list(struct.unpack_from(f"<{nwords}I", data, 4)) if nwords else []
 
         try:
-            decoded = _sdma_decode_fields(op, sub_op, header_dw, words, emit)
+            label, fields, decoded = _sdma_decode_fields(op, sub_op, header_dw, words)
         except IndexError:
-            emit("  Failed to decode packet (short on fields)")
-            decoded = True
-        if not decoded:
-            emit(f"  (recognized, {size} bytes, not decoded in detail)")
+            label, fields, decoded = None, [], False
+        _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size)
 
         if op == 4 and nwords >= 3:  # INDIRECT -- follow one level, see docstring
             ib_vmid = (header_dw >> 16) & 0xF

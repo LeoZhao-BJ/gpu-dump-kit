@@ -643,13 +643,20 @@ def _enrich_sdma_pointers(rows):
 
 
 _TARGET_ID_QID_SUFFIX_RE = re.compile(r"\s*\(QID \d+\)\s*$")
+_TARGET_ID_RE = re.compile(r"^AMDGPU Queue (\d+):(\d+)\s*\(QID \d+\)\s*$")
 
 
 def _sanitize_target_id(target_id):
     """Turn a target_id like 'AMDGPU Queue 5:27 (QID 6)' into a
-    filesystem-safe fragment ('AMDGPU_Queue_5_27') for use in dump filenames.
-    The trailing '(QID N)' is stripped since the QID is already encoded
-    separately in the filename (e.g. 'QID6')."""
+    filesystem-safe fragment ('GPU_5_Queue_27') for use in dump filenames.
+    The QID is dropped since it's already encoded separately in the
+    filename (e.g. 'QID6')."""
+    m = _TARGET_ID_RE.match(target_id)
+    if m:
+        gpu, queue = m.group(1), m.group(2)
+        return f"GPU_{gpu}_Queue_{queue}"
+    # Fallback for anything that doesn't match the expected shape -- sanitize
+    # generically rather than failing outright.
     stem = _TARGET_ID_QID_SUFFIX_RE.sub("", target_id)
     safe = re.sub(r"[^A-Za-z0-9]+", "_", stem).strip("_")
     return safe or "unknown"
@@ -759,13 +766,13 @@ class DumpAllQueues(gdb.Command):
             target_frag = _sanitize_target_id(row["target_id"])
 
             if qtype == "HSA":
-                filename = os.path.join(out_dir, f"hsa_queue_{label}_{target_frag}.log")
+                filename = os.path.join(out_dir, f"hsa_{label}_{target_frag}.log")
             elif qtype in _SDMA_LIKE_TYPES:
                 # DMA and XGMI are both SDMA-engine rings (XGMI is just the
                 # cross-die-interconnect variant of the same DMA engine) --
                 # same packet format, decode both the same way.
                 filename = os.path.join(
-                    out_dir, f"{qtype.lower()}_queue_{label}_{target_frag}.log"
+                    out_dir, f"{qtype.lower()}_{label}_{target_frag}.log"
                 )
             else:
                 print(f"Skipping unrecognized queue type '{qtype}' for {row['target_id']}")
@@ -924,10 +931,10 @@ class DumpAllQueuesBinary(gdb.Command):
             target_frag = _sanitize_target_id(row["target_id"])
 
             if qtype == "HSA":
-                filename = os.path.join(out_dir, f"hsa_queue_{label}_{target_frag}.bin")
+                filename = os.path.join(out_dir, f"hsa_{label}_{target_frag}.bin")
             elif qtype in _SDMA_LIKE_TYPES:
                 filename = os.path.join(
-                    out_dir, f"{qtype.lower()}_queue_{label}_{target_frag}.bin"
+                    out_dir, f"{qtype.lower()}_{label}_{target_frag}.bin"
                 )
             else:
                 print(f"Skipping unrecognized queue type '{qtype}' for {row['target_id']}")

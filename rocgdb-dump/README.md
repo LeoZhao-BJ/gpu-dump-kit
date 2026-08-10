@@ -76,12 +76,11 @@ dump_all_queues complete: rocgdb_dump_pid<pid>_<timestamp>
   info dispatches: rocgdb_dump_pid<pid>_<timestamp>/info_dispatches.log
   summary: rocgdb_dump_pid<pid>_<timestamp>/dump_summary.json
 ```
-Each queue is saved as `hsa_queue_QID<N>_<TargetId>.log` / `dma_queue_QID<N>_<TargetId>.log`
-(also `xgmi_queue_QID<N>_<TargetId>.log` for XGMI-transport DMA queues) in that directory, decoded
+Each queue is saved as `hsa_QID<N>_GPU_<A>_Queue_<B>.log` / `dma_QID<N>_GPU_<A>_Queue_<B>.log`
+(also `xgmi_QID<N>_GPU_<A>_Queue_<B>.log` for XGMI-transport DMA queues) in that directory, decoded
 packet-by-packet as text. `<N>` is the same `(QID N)` shown by `info queue` (use that to
-cross-reference against CLR-side logs); `<TargetId>` is the queue's Target Id from `info queue`
-(e.g. `AMDGPU Queue 5:27 (QID 6)`) with the `(QID N)` suffix stripped and everything else
-sanitized to `[A-Za-z0-9_]`, e.g. `hsa_queue_QID6_AMDGPU_Queue_5_27.log`.
+cross-reference against CLR-side logs); `<A>`/`<B>` come from the queue's Target Id in `info queue`
+(`AMDGPU Queue <A>:<B> (QID N)`), e.g. Target Id `AMDGPU Queue 5:27 (QID 6)` -> `hsa_QID6_GPU_5_Queue_27.log`.
 Pass a directory name to control where it's written: `dump_all_queues /tmp/my_capture`. One
 bad/unreadable queue won't stop the rest of the batch; failures are reported in the summary.
 
@@ -120,8 +119,8 @@ the per-queue ring data.
 Then, with **no gdb involved at all**, open any of those `.bin` files in the standalone
 `queue_viewer.py` and browse packets interactively:
 ```
-$ python3 queue_viewer.py rocgdb_dump_bin_pid.../hsa_queue_QID27_AMDGPU_Queue_1_27.bin
-Loaded .../hsa_queue_QID27_AMDGPU_Queue_1_27.bin (HSA, qid=27)
+$ python3 queue_viewer.py rocgdb_dump_bin_pid.../hsa_QID27_GPU_1_Queue_27.bin
+Loaded .../hsa_QID27_GPU_1_Queue_27.bin (HSA, qid=27)
 16384 packet(s) decoded/available (indices 0..16383)
 Type 'help' for commands.
 (queue_viewer) > info
@@ -226,8 +225,8 @@ directly against HSA ones; they mean different things.
   this -- it assumed every `COPY` was the `LINEAR` sub-opcode's fixed 28 bytes and every
   `POLL_REGMEM` was the `MEM` sub-opcode's fixed 24 bytes, silently corrupting the rest of the
   ring's decode whenever a different sub-opcode showed up.)
-- **Field-level decode** -- the human-readable "Copy Packet Fields:", "Fence Packet Fields:",
-  etc. blocks -- is a port of `sdma_decode_opcodes.c`'s `decode_upto_ai()`, the one (of four:
+- **Field-level decode** -- broken down into the two-column view described below -- is a port
+  of `sdma_decode_opcodes.c`'s `decode_upto_ai()`, the one (of four:
   VI/AI/NV/OSS7) generation-specific decoder that matches this host's confirmed SDMA IP version
   (major 4, minor 4 -- cross-checked against `sdma_decode_opcodes.c`'s own version-gating logic).
   **The other three generations are not ported** -- an unrecognized-but-correctly-sized packet
@@ -248,6 +247,27 @@ directly against HSA ones; they mean different things.
   intentionally not field-decoded -- they're pre-GCN/early-GCN modes that don't occur on this
   hardware in practice, and are exactly the opcodes UMR's own AI decoder defers on too. They're
   still sized correctly (so the ring walk never desyncs), just shown generically.
+
+Each packet is displayed as a two-column view -- raw hex on the left (grouped by dword; a
+`┌`/`┘` bracket connects the two dwords of a 64-bit LO/HI field; fields sharing one dword show
+the hex only on their first row), decoded `NAME = value` text on the right, separated by `|`.
+The packet type is shown ALL CAPS at the top-right of each packet's header:
+```
+------------------------------------------------------------------------------------
+Packet #2 at 0x7e7b51a00024                                          COPY (LINEAR)
+------------------------------------------------------------------------------------
++0x00  2a 10 03 06                 | HEADER op=0x1 sub_op=0x0
++0x04  00 04 00 00                 | COPY_COUNT = 1024
++0x08  00 00 00 00                 | DST_SW = 0
+                                   | DST_CACHE_POLICY = 0
+                                   | SRC_SW = 0
+                                   | SRC_CACHE_POLICY = 0
++0x0c  00 00 34 56 ┌
++0x10  12 f1 7f 00 ┘               | SRC_ADDR = 0x7f1234560000
++0x14  00 00 70 45 ┌
++0x18  12 f1 7f 00 ┘               | DST_ADDR = 0x7f1234570000
+------------------------------------------------------------------------------------
+```
 
 ### Browser UI instead of the REPL
 Same tool, `--web` instead of nothing, and point it at a whole `dump_all_queues_bin` output

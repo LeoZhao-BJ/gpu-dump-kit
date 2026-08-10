@@ -35,8 +35,8 @@ if _SCRIPT_DIR not in sys.path:
 import queue_decode as qd
 
 _SDMA_LIKE_TYPES = {"DMA", "XGMI"}
-_SEPARATOR = "-" * 30
-_PACKET_ADDR_RE = re.compile(r"at 0x([0-9a-fA-F]+):")
+_SEPARATOR = "-" * 84  # must match queue_decode.py's _SDMA_SEPARATOR_WIDTH
+_PACKET_TITLE_RE = re.compile(r"^Packet #\d+ at 0x([0-9a-fA-F]+)")
 _WEB_ALL_CAP = 2000  # don't let a browser tab try to render a 100k+-packet ring in one go
 
 
@@ -114,22 +114,37 @@ class QueueDump:
         qd.decode_sdma_packets(
             self.reader, self.metadata["addr"], self.metadata["size"], emit=lines.append
         )
+        # Each packet is now bounded by its own opening AND closing separator
+        # (queue_decode.py's _render_sdma_packet: SEP, TITLE, SEP, ...rows...,
+        # SEP), so a plain "line == separator" split would create a spurious
+        # extra block between every pair of packets (packet N's closing
+        # separator immediately followed by packet N+1's opening one).
+        # Split on the "Packet #N at 0x..." title line instead -- it appears
+        # exactly once per packet -- and stop absorbing lines into the
+        # current block as soon as its own *second* separator (the closing
+        # one; the first is the one right after its title) has been seen,
+        # so the next packet's leading separator doesn't get glued onto the
+        # tail of the previous block. Lines before the very first title (the
+        # first packet's opening separator) are discarded, not stored.
         blocks = []
         addrs = []
         current = None
+        seps_in_block = 0
         for line in lines:
-            if line == _SEPARATOR:
-                current = []
+            if _PACKET_TITLE_RE.match(line):
+                current = [line]
                 blocks.append(current)
+                seps_in_block = 0
                 continue
             if current is None:
-                # shouldn't normally happen -- decoder always leads with
-                # the separator -- but don't lose the line if it does
-                current = []
-                blocks.append(current)
+                continue
             current.append(line)
+            if line == _SEPARATOR:
+                seps_in_block += 1
+                if seps_in_block >= 2:
+                    current = None  # block fully closed
         for block in blocks:
-            m = _PACKET_ADDR_RE.search(block[0]) if block else None
+            m = _PACKET_TITLE_RE.match(block[0]) if block else None
             addrs.append(int(m.group(1), 16) if m else None)
         self._sdma_blocks = blocks
         self._sdma_addrs = addrs
