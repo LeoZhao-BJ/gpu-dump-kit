@@ -166,19 +166,21 @@ def _hsa_decode_fields(words, symbol_lookup):
     return label, fields, decoded
 
 
-def _render_hsa_packet(emit, addr, i, words, label, fields, decoded):
+def _render_hsa_packet(emit, addr, i, words, label, fields, decoded, use_color=False):
     """Render one decoded HSA packet in the same two-column hex/field layout
     as SDMA (see _emit_field_groups); `words[i]` starts at byte offset 4*i
     (the packet's very first byte), since HSA has no separately-tracked
     header dword the way SDMA does."""
-    _render_packet_title(emit, addr, i, 64, label if label else "UNKNOWN")  # AQL packets are always 64 bytes
+    _render_packet_title(
+        emit, addr, i, 64, label if label else "UNKNOWN", use_color=use_color
+    )  # AQL packets are always 64 bytes
     _emit_field_groups(emit, fields, words, lambda w: 4 * w)
     if not decoded:
         _pkt_row(emit, "", "(not decoded in detail)")
     emit("-" * _PKT_SEPARATOR_WIDTH)
 
 
-def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_lookup=None):
+def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_lookup=None, use_color=False):
     """Decode HSA AQL packets [start_idx, end_idx) (64-byte slots) at base.
 
     start_idx/end_idx must already be resolved slot indices (no modulo
@@ -189,6 +191,11 @@ def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_look
     kernel_object address to a human-readable name (e.g. via a live
     process's symbol table). When None, kernel dispatch packets just show
     the raw address.
+
+    use_color: colorize each packet's title (red INVALID / green everything
+    else) -- only pass True when `emit` goes straight to a real terminal for
+    a human to read; see the ANSI comment above _render_packet_title for why
+    this must stay off for file/JSON destinations.
 
     Rendered via _render_hsa_packet() as the same two-column hex/field view
     used by the SDMA decoder -- see _hsa_decode_fields()'s docstring for
@@ -204,7 +211,7 @@ def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_look
 
         words = list(struct.unpack_from("<16I", data, 0))
         label, fields, decoded = _hsa_decode_fields(words, symbol_lookup)
-        _render_hsa_packet(emit, addr, i, words, label, fields, decoded)
+        _render_hsa_packet(emit, addr, i, words, label, fields, decoded, use_color=use_color)
 
 
 _POLL_REGMEM_FUNCS = ["always", "<", "<=", "==", "!=", ">=", ">", "N/A"]
@@ -839,18 +846,39 @@ def _sdma_decode_fields(op, sub_op, header_dw, words):
 _PKT_LEFTCOL_WIDTH = 35  # width of the hex column (before "| "), confirmed with the user
 _PKT_SEPARATOR_WIDTH = 84
 
+# ANSI, used only when a caller opts in via use_color=True (see
+# _render_packet_title) -- callers writing to a real terminal for a human to
+# read (queue_viewer.py's REPL, rocgdb's interactive dump_hsa_queue/
+# dump_sdma_queue commands) pass True; anything writing to a file or
+# collecting lines for JSON (dump_all_queues_txt's per-queue .log files,
+# queue_viewer.py --web's HTTP responses) must NOT -- raw escape codes would
+# either sit uselessly in a saved log or render as garbage in a browser.
+_ANSI_RED = "\033[1;31m"
+_ANSI_GREEN = "\033[1;32m"
+_ANSI_RESET = "\033[0m"
+
 
 def _pkt_hex_bytes(dword):
     return " ".join(f"{b:02x}" for b in struct.pack("<I", dword & 0xFFFFFFFF))
 
 
-def _render_packet_title(emit, addr, i, size, type_label):
+def _render_packet_title(emit, addr, i, size, type_label, use_color=False):
     """Emit the "Packet #N at 0x... (N bytes) <TYPE LABEL>" title framed by
-    separator lines, shared by the HSA and SDMA renderers."""
+    separator lines, shared by the HSA and SDMA renderers. When use_color is
+    set, the type label itself is colored -- red for INVALID (an AQL type-1
+    slot, usually meaning idle/already-consumed rather than a real packet),
+    green for everything else -- so a scroll of packet titles is easy to
+    scan by eye for the invalid ones. Padding is computed from the
+    *uncolored* label length so the ANSI escape bytes (invisible on screen)
+    don't throw off the column alignment."""
     title = f"Packet #{i} at 0x{addr:x} ({size} bytes)"
     pad = max(1, _PKT_SEPARATOR_WIDTH - 2 - len(title) - len(type_label))
+    displayed_label = type_label
+    if use_color:
+        color = _ANSI_RED if type_label == "INVALID" else _ANSI_GREEN
+        displayed_label = f"{color}{type_label}{_ANSI_RESET}"
     emit("-" * _PKT_SEPARATOR_WIDTH)
-    emit(f"{title}{' ' * pad}{type_label}")
+    emit(f"{title}{' ' * pad}{displayed_label}")
     emit("-" * _PKT_SEPARATOR_WIDTH)
 
 
@@ -904,14 +932,14 @@ def _emit_field_groups(emit, fields, words, byte_offset):
             _pkt_row(emit, "", name if value is None else f"{name} = {value}")
 
 
-def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size):
+def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size, use_color=False):
     """Render one decoded SDMA packet in the two-column hex/field layout
     (see _emit_field_groups for the shared mechanics). `words[i]` is the
     dword at byte offset 4+4*i -- right after the header dword, which is
     tracked separately and always shown as its own first row.
     """
     type_label = label if label else f"OP=0x{op:x} SUB_OP=0x{sub_op:x}"
-    _render_packet_title(emit, addr, i, size, type_label)
+    _render_packet_title(emit, addr, i, size, type_label, use_color=use_color)
     _pkt_row(emit, f"+0x00  {_pkt_hex_bytes(header_dw)}", f"HEADER op=0x{op:x} sub_op=0x{sub_op:x}")
     _emit_field_groups(emit, fields, words, lambda w: 4 + 4 * w)
 
@@ -921,7 +949,7 @@ def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fiel
     emit("-" * _PKT_SEPARATOR_WIDTH)
 
 
-def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
+def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0, use_color=False):
     """Walk and decode SDMA packets starting at base for up to max_size
     bytes. Sizing is a full port of UMR's sized_oss1_5() (all opcodes/
     sub-opcodes, generation-agnostic); field-level decoding matches
@@ -940,6 +968,11 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
     available in this dump" when it can't (the offline queue_viewer.py path,
     whose BufferReader only has the ring's own dumped bytes). `_depth`
     guards against runaway/cyclic IB chains.
+
+    use_color: colorize each packet's title -- see decode_hsa_packets'
+    docstring for when this is/isn't safe to pass True. SDMA packets have no
+    "INVALID" concept (that's AQL/HSA-specific), so every title renders
+    green when this is set.
     """
     addr = base
     end = base + max_size
@@ -982,7 +1015,7 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
             label, fields, decoded = _sdma_decode_fields(op, sub_op, header_dw, words)
         except IndexError:
             label, fields, decoded = None, [], False
-        _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size)
+        _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size, use_color=use_color)
 
         if op == 4 and nwords >= 3:  # INDIRECT -- follow one level, see docstring
             ib_vmid = (header_dw >> 16) & 0xF
@@ -997,7 +1030,7 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
                     emit(f"  IB at 0x{ib_addr:x} (vmid={ib_vmid}, size={ib_size}) not available in this dump")
                 else:
                     emit(f"  -- following indirect buffer at 0x{ib_addr:x} (vmid={ib_vmid}, size={ib_size}) --")
-                    decode_sdma_packets(reader, ib_addr, ib_size, emit=emit, _depth=_depth + 1)
+                    decode_sdma_packets(reader, ib_addr, ib_size, emit=emit, _depth=_depth + 1, use_color=use_color)
 
         addr += size
         i += 1

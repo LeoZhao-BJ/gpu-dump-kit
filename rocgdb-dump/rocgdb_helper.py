@@ -42,18 +42,23 @@ def _symbol_lookup(addr):
         return None
 
 
-def decode_hsa_queue(inferior, base, start_idx, end_idx, emit=print):
+def decode_hsa_queue(inferior, base, start_idx, end_idx, emit=print, use_color=False):
     """Decode HSA AQL packets [start_idx, end_idx) (64-byte slots) at base.
-    Thin wrapper around the shared queue_decode.decode_hsa_packets()."""
+    Thin wrapper around the shared queue_decode.decode_hsa_packets(). Only
+    pass use_color=True when emit prints straight to a real terminal (see
+    decode_hsa_packets' docstring) -- never for the batch/file-writing path
+    (dump_all_queues_txt writes to .log files, not the console)."""
     qd.decode_hsa_packets(
-        GdbReader(inferior), base, start_idx, end_idx, emit=emit, symbol_lookup=_symbol_lookup
+        GdbReader(inferior), base, start_idx, end_idx, emit=emit,
+        symbol_lookup=_symbol_lookup, use_color=use_color,
     )
 
 
-def decode_sdma_queue(inferior, base, max_size, emit=print):
+def decode_sdma_queue(inferior, base, max_size, emit=print, use_color=False):
     """Walk and decode SDMA packets at base, up to max_size bytes.
-    Thin wrapper around the shared queue_decode.decode_sdma_packets()."""
-    qd.decode_sdma_packets(GdbReader(inferior), base, max_size, emit=emit)
+    Thin wrapper around the shared queue_decode.decode_sdma_packets(). Same
+    use_color caveat as decode_hsa_queue."""
+    qd.decode_sdma_packets(GdbReader(inferior), base, max_size, emit=emit, use_color=use_color)
 
 
 class DumpHsaQueue(gdb.Command):
@@ -80,7 +85,7 @@ class DumpHsaQueue(gdb.Command):
         assert start_idx < end_idx
 
         inferior = gdb.selected_inferior()
-        decode_hsa_queue(inferior, base, start_idx, end_idx, emit=print)
+        decode_hsa_queue(inferior, base, start_idx, end_idx, emit=print, use_color=sys.stdout.isatty())
 
 
 DumpHsaQueue()
@@ -264,7 +269,7 @@ class DumpSdmaQueue(gdb.Command):
         max_size = 1024 * 1024 if len(args) == 1 else int(gdb.parse_and_eval(args[1]))
 
         inferior = gdb.selected_inferior()
-        decode_sdma_queue(inferior, base, max_size, emit=print)
+        decode_sdma_queue(inferior, base, max_size, emit=print, use_color=sys.stdout.isatty())
 
 
 DumpSdmaQueue()

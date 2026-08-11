@@ -309,6 +309,33 @@ in the title (`(N bytes)`).
       the exact right number of packets -- no spurious empty blocks from
       the double-separator-per-packet format (title regex `^Packet #\d+ at 0x...`
       is what splits blocks now, not bare separator lines).
+- [ ] **Packet title coloring (`use_color`, opt-in):** with `use_color=True`,
+      the type label is wrapped in bold red ANSI (`\033[1;31m...\033[0m`)
+      for `INVALID`, bold green (`\033[1;32m`) for everything else (SDMA
+      packets, having no "invalid" concept, are always green). Column
+      alignment (the pipe still at column 35 on field rows; the type label
+      still right-aligned in the title) is unaffected -- padding is
+      computed from the *uncolored* label length before the ANSI bytes are
+      added. Default (`use_color` omitted/`False`) produces byte-identical
+      output to before this feature existed.
+- [ ] **Coloring must stay opt-in per call site, never leak where it
+      shouldn't:**
+      - `queue_viewer.py`'s REPL (`run_repl`/`run_repl_dir`) constructs
+        `QueueDump(..., use_color=_USE_COLOR)` where
+        `_USE_COLOR = sys.stdout.isatty()` -- colored only when actually
+        connected to a real terminal, plain when piped/redirected (e.g.
+        through `tee` to a log file).
+      - `queue_viewer.py --web`'s `_QueueWebState.get()` constructs
+        `QueueDump(...)` with **no** `use_color` kwarg (always `False`) --
+        this must hold even when the server process's own stdout is a
+        real terminal, since the decoded lines are sent to the browser as
+        JSON, not printed locally.
+      - `rocgdb_helper.py`'s interactive `dump_hsa_queue`/`dump_sdma_queue`
+        commands pass `use_color=sys.stdout.isatty()`.
+      - `rocgdb_helper.py`'s `dump_all_queues_txt` batch path (writing
+        per-queue `.log` files) passes no `use_color` kwarg -- must never
+        colorize, since these are saved files read later, not a live
+        terminal session.
 
 ```bash
 python3 -c "
@@ -327,6 +354,47 @@ for l in lines:
     if '|' in l:
         assert l.index('|') == 35, l
 print('OK: all pipes aligned at column 35')
+
+# use_color=False (default) must be byte-identical to the lines above
+lines_default = []
+qd.decode_sdma_packets(R(base, buf), base, len(buf), emit=lines_default.append)
+assert lines == lines_default
+
+# use_color=True: SDMA packets are always green (no INVALID concept)
+lines_colored = []
+qd.decode_sdma_packets(R(base, buf), base, len(buf), emit=lines_colored.append, use_color=True)
+assert any('\033[1;32m' in l for l in lines_colored), 'expected green ANSI in a colored SDMA title'
+assert not any('\033[1;31m' in l for l in lines_colored), 'SDMA should never render red'
+print('OK: use_color threading correct')
+"
+```
+
+```bash
+# real end-to-end: piped (non-tty) must be plain; a pty (real terminal) must show ANSI
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+DUMP_DIR=$(ls -d rocgdb_dump_bin_pid*/ | head -1)
+NAME=$(ls "$DUMP_DIR"/hsa_*.bin | head -1)
+printf 'rp\nquit\n' | python3 queue_viewer.py "$NAME" | cat -A | grep -q '\^\[' \
+  && echo "FAIL: ANSI leaked when piped" || echo "OK: no ANSI when piped"
+
+python3 -c "
+import pty, os, subprocess, time
+master, slave = pty.openpty()
+p = subprocess.Popen(['python3', 'queue_viewer.py', '$NAME'], stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+time.sleep(0.5); os.write(master, b'rp\n'); time.sleep(0.5); os.write(master, b'quit\n'); time.sleep(0.5)
+out = b''
+try:
+    while True:
+        chunk = os.read(master, 4096)
+        if not chunk: break
+        out += chunk
+except OSError:
+    pass
+p.wait()
+text = out.decode(errors='replace')
+assert '\x1b[1;31m' in text or '\x1b[1;32m' in text, 'expected some ANSI color in a real-pty run'
+print('OK: ANSI present via pty (real terminal)')
 "
 ```
 
@@ -436,6 +504,16 @@ to), mirroring `--web`'s sidebar without needing a browser
       `no queue selected -- try 'list' then 'use <index_or_name>'` instead
       of crashing.
 - [ ] `list` while a queue is selected marks it with `*` in the listing.
+- [ ] **`PENDING` highlight (`_is_pending`/`_highlight`):** a queue whose
+      `rp`/`wp` are both known and differ (submitted work the GPU hasn't
+      consumed yet) gets a `<-- PENDING` suffix on its `list`
+      line -- e.g. `rp=21 wp=48 <-- PENDING`; a queue where
+      `rp == wp`, or where either is `None` (enrichment found nothing),
+      gets no suffix at all -- "unknown" is not flagged as "pending".
+      When stdout is a real terminal (`sys.stdout.isatty()`), the whole
+      pending line is wrapped in bold red ANSI (`\033[1;31m...\033[0m`);
+      when piped/redirected (e.g. through `tee` to a log file), only the
+      plain-text marker appears -- no raw escape codes leak into the log.
 - [ ] `help` shows both the directory commands (`list`/`use`) and the full
       single-file `HELP_TEXT`.
 - [ ] Switching `use` between an HSA and a DMA/XGMI queue in the same
@@ -461,6 +539,30 @@ mkdir -p /tmp/qv_empty_test && python3 queue_viewer.py /tmp/qv_empty_test; echo 
 rmdir /tmp/qv_empty_test
 ```
 
+```bash
+# PENDING highlight: piped (non-tty) -- plain marker only, no ANSI escapes
+printf 'list\nquit\n' | python3 queue_viewer.py "$DUMP_DIR" | cat -A | grep -q '\^\[' \
+  && echo "FAIL: raw ANSI escapes leaked into piped output" \
+  || echo "OK: no ANSI escapes when piped"
+printf 'list\nquit\n' | python3 queue_viewer.py "$DUMP_DIR" | grep -- "<-- PENDING"
+# expect: at least the rows with rp != wp, each ending in the plain marker
+
+# unit test: _is_pending / _highlight logic directly
+python3 -c "
+import sys; sys.path.insert(0, '.')
+import queue_viewer as qv
+assert qv._is_pending({'read': 1, 'write': 2}) is True
+assert qv._is_pending({'read': 2, 'write': 2}) is False
+assert qv._is_pending({'read': None, 'write': 2}) is False
+assert qv._is_pending({'read': 1, 'write': None}) is False
+qv._USE_COLOR = True
+assert qv._highlight('x').startswith('\033[1;31m') and qv._highlight('x').endswith('\033[0m')
+qv._USE_COLOR = False
+assert qv._highlight('x') == 'x'
+print('OK')
+"
+```
+
 ---
 
 ## 10. `queue_viewer.py --web` browser UI (parity with the REPL)
@@ -475,10 +577,15 @@ output identical (line-for-line) to the equivalent REPL command, not just
       at (`os.path.abspath(path)`), and contains no leftover
       `__ROOT_PATH_JSON__` template marker.
 - [ ] `GET /api/list` returns one entry per `.bin` file with
-      `name`/`qid`/`type`/`size`/`target_id`/`count` (`count` is
-      `packet_count()` -- full ring walk for SDMA/XGMI, `size/64` for HSA);
-      a file that fails to load (bad header, truncated) gets `{"name":...,
-      "error": "..."}` instead of killing the whole listing.
+      `name`/`qid`/`type`/`size`/`target_id`/`count`/`read`/`write`/`pending`
+      (`count` is `packet_count()` -- full ring walk for SDMA/XGMI, `size/64`
+      for HSA; `pending` is `_is_pending()` on that file's metadata -- `true`
+      only when `read`/`write` are both non-null and differ); a file that
+      fails to load (bad header, truncated) gets `{"name":..., "error":
+      "..."}` instead of killing the whole listing.
+- [ ] Sidebar cards for `pending: true` entries get the `.qitem.pending` CSS
+      class (red left border) and a `PENDING` badge -- same signal as the
+      REPL's `list` highlight, just visual instead of ANSI/text.
 - [ ] `GET /api/help` returns `{"lines": [...]}` matching `HELP_TEXT.splitlines()`
       -- single source of truth with the REPL's `help` command, not a
       hand-duplicated copy in the JS.

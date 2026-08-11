@@ -61,6 +61,29 @@ _SEPARATOR = "-" * 84  # must match queue_decode.py's _PKT_SEPARATOR_WIDTH
 _PACKET_TITLE_RE = re.compile(r"^Packet #\d+ at 0x([0-9a-fA-F]+)")
 _WEB_ALL_CAP = 2000  # don't let a browser tab try to render a 100k+-packet ring in one go
 
+# rp != wp means there's submitted work the GPU hasn't consumed yet -- for a
+# hung process, that's exactly the queue(s) worth looking at first, so the
+# REPL's 'list' highlights them rather than leaving it to eyeball a column of
+# numbers. Colorized only when stdout is a real terminal -- a piped/redirected
+# run (e.g. through `tee` to a log file) still gets the plain-text marker.
+_USE_COLOR = sys.stdout.isatty()
+_PENDING_MARK = " <-- PENDING"
+
+
+def _is_pending(metadata):
+    """True if this queue's rp/wp are both known and differ -- i.e. there's
+    submitted work not yet consumed by the GPU. None/either-missing (not
+    enriched, or an empty queue with no rp/wp at all) is not 'pending', just
+    unknown -- only flag it when we can actually tell."""
+    rp, wp = metadata.get("read"), metadata.get("write")
+    return rp is not None and wp is not None and rp != wp
+
+
+def _highlight(text):
+    if not _USE_COLOR:
+        return text
+    return f"\033[1;31m{text}\033[0m"  # bold red
+
 
 class BufferReader:
     """queue_decode reader interface backed by an in-memory byte buffer
@@ -83,8 +106,11 @@ class BufferReader:
 class QueueDump:
     """One loaded .bin dump: metadata + raw bytes + decode-on-demand."""
 
-    def __init__(self, path):
+    def __init__(self, path, use_color=False):
         self.path = path
+        self.use_color = use_color  # colorize packet titles (see queue_decode's ANSI comment) --
+        # only ever set True by the REPL (a real terminal); --web must never
+        # set this, since the decoded lines get sent to the browser as JSON.
         with open(path, "rb") as f:
             self.metadata = qd.read_dump_header(f)
             self.buf = f.read()
@@ -126,7 +152,9 @@ class QueueDump:
         return self.metadata["size"] // 64
 
     def _print_hsa_range(self, start, end, emit=print):
-        qd.decode_hsa_packets(self.reader, self.metadata["addr"], start, end, emit=emit)
+        qd.decode_hsa_packets(
+            self.reader, self.metadata["addr"], start, end, emit=emit, use_color=self.use_color
+        )
 
     # -- SDMA/XGMI: walk once, cache blocks -----------------------------
     def _ensure_sdma_walked(self):
@@ -134,7 +162,8 @@ class QueueDump:
             return
         lines = []
         qd.decode_sdma_packets(
-            self.reader, self.metadata["addr"], self.metadata["size"], emit=lines.append
+            self.reader, self.metadata["addr"], self.metadata["size"], emit=lines.append,
+            use_color=self.use_color,
         )
         # Each packet is now bounded by its own opening AND closing separator
         # (queue_decode.py's _render_sdma_packet: SEP, TITLE, SEP, ...rows...,
@@ -476,7 +505,7 @@ def run_repl_dir(path):
 
     def get(name):
         if name not in dumps:
-            dumps[name] = QueueDump(paths_by_name[name])
+            dumps[name] = QueueDump(paths_by_name[name], use_color=_USE_COLOR)
         return dumps[name]
 
     def resolve_name(token):
@@ -511,9 +540,14 @@ def run_repl_dir(path):
                     f"type={m.get('type')} size={m.get('size')} "
                     f"rp={m.get('read')} wp={m.get('write')}"
                 )
+                pending = _is_pending(m)
             except Exception as e:
                 detail = f"error: {e}"
-            print(f" {marker} [{i}] {name}  {detail}")
+                pending = False
+            line = f" {marker} [{i}] {name}  {detail}"
+            if pending:
+                line = _highlight(line + _PENDING_MARK)
+            print(line)
 
     print(f"{len(names)} queue dump(s) found under {path}")
     print_list()
@@ -597,7 +631,8 @@ _INDEX_HTML = """<!doctype html>
   :root {
     --bg: #f4f5f7; --panel: #ffffff; --border: #dde1e6; --text: #1c2128;
     --muted: #6b7280; --accent: #2563eb; --accent-bg: #eaf1ff;
-    --hsa: #2563eb; --dma: #059669; --xgmi: #7c3aed;
+    --hsa: #2563eb; --dma: #059669; --xgmi: #7c3aed; --pending: #dc2626;
+    --pending-bg: #fef2f2;
     --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     --ui: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
@@ -639,11 +674,14 @@ _INDEX_HTML = """<!doctype html>
   .qitem { padding: 8px 10px; margin: 3px 4px; cursor: pointer; border-radius: 6px; border: 1px solid transparent; }
   .qitem:hover { background: var(--bg); }
   .qitem.selected { background: var(--accent-bg); border-color: var(--accent); }
+  .qitem.pending { background: var(--pending-bg); border-left: 3px solid var(--pending); }
+  .qitem.pending.selected { background: var(--accent-bg); border-left: 3px solid var(--pending); }
   .qname { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
   .qmeta { color: var(--muted); font-size: 11px; margin-top: 3px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; color: #fff; letter-spacing: 0.02em; }
   .badge.hsa { background: var(--hsa); }
   .badge.dma { background: var(--dma); }
+  .badge.pending { background: var(--pending); }
   .badge.xgmi { background: var(--xgmi); }
   .badge.err { background: #dc2626; }
   #empty-hint { padding: 30px 8px; color: var(--muted); font-size: 13px; }
@@ -718,15 +756,16 @@ function loadList() {
     }
     items.forEach(it => {
       const div = document.createElement('div');
-      div.className = 'qitem';
+      div.className = 'qitem' + (it.pending ? ' pending' : '');
       div.dataset.name = it.name;
       if (it.error) {
         div.innerHTML = '<div class="qname">' + it.name + '</div>' +
           '<div class="qmeta"><span class="badge err">error</span>' + it.error + '</div>';
       } else {
         const count = (it.count === null || it.count === undefined) ? '?' : it.count;
+        const pendingBadge = it.pending ? '<span class="badge pending" title="rp != wp -- unconsumed work">PENDING</span> ' : '';
         div.innerHTML = '<div class="qname">' + it.name + '</div>' +
-          '<div class="qmeta"><span class="badge ' + badgeClass(it.type) + '">' + it.type + '</span>' +
+          '<div class="qmeta">' + pendingBadge + '<span class="badge ' + badgeClass(it.type) + '">' + it.type + '</span>' +
           'qid ' + it.qid + ' &middot; ' + count + ' pkt &middot; ' + it.size + ' B</div>';
       }
       div.onclick = () => selectQueue(it.name);
@@ -813,6 +852,9 @@ class _QueueWebState:
                         "size": d.metadata.get("size"),
                         "target_id": d.metadata.get("target_id"),
                         "count": count,
+                        "read": d.metadata.get("read"),
+                        "write": d.metadata.get("write"),
+                        "pending": _is_pending(d.metadata),
                     }
                 )
             except Exception as e:
@@ -954,7 +996,7 @@ def main():
         return run_repl_dir(args.path)
 
     try:
-        dump = QueueDump(args.path)
+        dump = QueueDump(args.path, use_color=_USE_COLOR)
     except (OSError, ValueError) as e:
         print(f"Cannot open {args.path}: {e}", file=sys.stderr)
         return 1

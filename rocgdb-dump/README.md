@@ -182,10 +182,10 @@ the whole session:
 ```
 $ python3 queue_viewer.py rocgdb_dump_bin_pid.../
 6 queue dump(s) found under rocgdb_dump_bin_pid.../
-   [0] dma_QID4_GPU_8_Queue_2.bin  type=DMA size=8388608 rp=21 wp=48
-   [1] dma_QID5_GPU_8_Queue_1.bin  type=DMA size=8388608 rp=21 wp=48
+   [0] dma_QID4_GPU_8_Queue_2.bin  type=DMA size=8388608 rp=21 wp=48 <-- PENDING
+   [1] dma_QID5_GPU_8_Queue_1.bin  type=DMA size=8388608 rp=21 wp=48 <-- PENDING
    [2] hsa_QID0_GPU_8_Queue_6.bin  type=HSA size=4096 rp=2 wp=2
-   [3] hsa_QID1_GPU_8_Queue_5.bin  type=HSA size=1048576 rp=0 wp=2
+   [3] hsa_QID1_GPU_8_Queue_5.bin  type=HSA size=1048576 rp=0 wp=2 <-- PENDING
    ...
 Type 'use <index_or_name>' to select one, 'list' to see this again, 'help' for commands.
 (queue_viewer) > use 3                    # by 0-based index...
@@ -198,10 +198,15 @@ switched to dma_QID4_GPU_8_Queue_2.bin (DMA, qid=4)
 (queue_viewer:dma_QID4_GPU_8_Queue_2.bin) > list              # '*' marks the currently selected queue
 (queue_viewer:dma_QID4_GPU_8_Queue_2.bin) > quit
 ```
-`list` (aliases `ls`/`queues`) only reads each dump's header, not its full ring bytes, so it stays
-fast regardless of how many/how large the queues in the directory are -- packet decoding only
-happens once a queue is actually selected via `use`. All of the single-file commands above
-(`info`/`packet`/`range`/`all`/`raw`/`rp`/`wp`) apply to whichever queue is currently selected;
+Rows where `rp != wp` -- submitted work the GPU hasn't consumed yet, exactly what's worth
+looking at first on a hung process -- are marked `<-- PENDING` and (when stdout is a
+real terminal, not piped/redirected) shown in bold red; rows where `rp`/`wp` aren't known at all
+(enrichment didn't find anything for that DMA/XGMI queue) are shown plain, not flagged, since
+"unknown" isn't the same as "pending". `list` (aliases `ls`/`queues`) only reads each dump's
+header, not its full ring bytes, so it stays fast regardless of how many/how large the queues in
+the directory are -- packet decoding only happens once a queue is actually selected via `use`.
+All of the single-file commands above (`info`/`packet`/`range`/`all`/`raw`/`rp`/`wp`) apply to
+whichever queue is currently selected;
 running one before any `use` prints a reminder instead of an error.
 
 Or point `--web` at the same directory for a plain-text browser UI instead of the REPL --
@@ -217,7 +222,8 @@ interfaces if you really want that, and `--port N` to change the port. No ring v
 stdlib `http.server` only, no extra dependencies to install. `all` is capped at 2000 packets in
 the browser view so a huge ring doesn't try to render a giant page in one go; use
 `range`/`packet` for anything beyond that. Full parity with the REPL, including `rp`/`wp`
-expressions in the `packet`/`range`/`raw` boxes.
+expressions in the `packet`/`range`/`raw` boxes. Queues where `rp != wp` get the same
+`PENDING` highlight as the REPL's `list` (a red left border and badge on the sidebar card).
 
 ### 2.3 Manual equivalent: driving rocgdb yourself
 
@@ -461,14 +467,25 @@ $4 = (hsa_queue_t *) 0x7f0757fde000
   +0x3c  12 7f 00 00 ┘               | COMPLETION_SIGNAL = 0x7f1234580000
   ------------------------------------------------------------------------------------
   ```
+  When printing straight to a real terminal (the REPL, or the interactive `dump_hsa_queue`/
+  `dump_sdma_queue` commands run directly in rocgdb), the type label itself is colored -- red
+  for `INVALID`, green for everything else -- so a scroll of packet titles is easy to scan by
+  eye. Never colorized when the destination isn't a terminal a human is directly looking at
+  (`dump_all_queues_txt`'s saved `.log` files, `queue_viewer.py --web`'s JSON responses) --
+  raw ANSI escape codes would either sit uselessly in a saved log or render as garbage text in
+  a browser.
 - **`queue_viewer.py` REPL** -- `info`/`packet`/`range`(`r`)/`all`/`raw`/`rp`/`wp`, up/down-arrow
   command history via `readline`, `rp`/`wp` accepted as index arguments (optionally `+N`/`-N`)
   anywhere a plain integer is accepted; directory mode adds `list`/`ls`/`queues` and
   `use <index_or_name>` (accepts an unambiguous filename prefix) to switch between every queue
-  in a directory without restarting the tool (see 2.2).
+  in a directory without restarting the tool (see 2.2). `list` highlights queues where
+  `rp != wp` (submitted work the GPU hasn't consumed yet -- the ones worth checking first on a
+  hung process) with a `<-- PENDING` marker, in bold red when stdout is a real
+  terminal; queues where `rp`/`wp` aren't known at all are left unflagged.
 - **`queue_viewer.py --web`** -- browser version of the same REPL, one page for a whole
   directory's queues, full parity including `rp`/`wp` expressions, JSON errors (400/404)
-  instead of tracebacks, binds to localhost only by default (see 2.2).
+  instead of tracebacks, binds to localhost only by default (see 2.2). Same `PENDING`
+  highlighting as the REPL's `list`, shown as a red-bordered card + badge in the sidebar.
 - **Manual, one-at-a-time commands** -- `dump_hsa_queue`, `dump_sdma_queue`,
   `dump_hsa_signal`, `modify_hsa_signal`, `dump_queue_memory` (see 2.5), original commands from
   the upstream `rocgdb_info` project this repo grew out of.
