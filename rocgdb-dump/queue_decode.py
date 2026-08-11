@@ -28,7 +28,7 @@ class MemoryReadError(Exception):
 
 # --- binary dump container format -------------------------------------
 #
-# One file per queue, written by rocgdb_helper.py's dump_all_queues_bin and
+# One file per queue, written by rocgdb_helper.py's dump_all_queues and
 # read by queue_viewer.py -- kept here so both sides can never disagree on
 # the wire format:
 #

@@ -19,7 +19,7 @@ Leo Zhao (2026-08):
   dependency, so it can be shared between the live rocgdb path and an offline tool.
 - `queue_viewer.py` -- new standalone tool (no gdb) that reads a `.bin` dump and lets you browse
   packets via an interactive REPL or a local browser UI.
-- `dump_all_queues` / `dump_all_queues_bin` commands in `rocgdb_helper.py` -- automatically find
+- `dump_all_queues` / `dump_all_queues_txt` commands in `rocgdb_helper.py` -- automatically find
   and dump every HSA/DMA/XGMI queue (plus all-thread backtraces) instead of hand-copying
   addresses out of `info queue` one at a time.
 - `rptr`/`wptr` jump navigation, XGMI queue-type support, and a handful of bug fixes found along
@@ -61,28 +61,32 @@ sudo rocgdb attach <hang_pid>
 source rocgdb_helper.py
 ```
 
-## Auto-dump everything (recommended first step)
-No manual copy/paste from `info queue` needed -- this finds every HSA/DMA queue itself,
-decodes each one's full ring to a text file, captures `info queues`/`info dispatches`, and
-saves all-thread backtraces, all in one shot:
+## Auto-dump everything, fast (recommended first step)
+No manual copy/paste from `info queue` needed -- this finds every HSA/DMA/XGMI queue itself,
+reads each one's raw bytes with a single bulk memory read (fast -- one round-trip per queue,
+not per packet), captures `info queues`/`info dispatches`, and saves all-thread backtraces, all
+in one shot. Each queue's metadata (qid, type, address, rptr/wptr, size, ...) is saved alongside
+its raw bytes in one `.bin` file per queue; decode happens later, offline, against an in-memory
+buffer instead of over gdb:
 ```
 (gdb) dump_all_queues
 ------------------------------
-dump_all_queues complete: rocgdb_dump_pid<pid>_<timestamp>
+dump_all_queues complete: rocgdb_dump_bin_pid<pid>_<timestamp>
   HSA queues captured: 20
-  DMA queues captured: 8
-  backtraces: rocgdb_dump_pid<pid>_<timestamp>/backtrace_all_threads.log
-  info queues: rocgdb_dump_pid<pid>_<timestamp>/info_queues.log
-  info dispatches: rocgdb_dump_pid<pid>_<timestamp>/info_dispatches.log
-  summary: rocgdb_dump_pid<pid>_<timestamp>/dump_summary.json
+  DMA/XGMI queues captured: 8
+  backtraces: rocgdb_dump_bin_pid<pid>_<timestamp>/backtrace_all_threads.log
+  info queues: rocgdb_dump_bin_pid<pid>_<timestamp>/info_queues.log
+  info dispatches: rocgdb_dump_bin_pid<pid>_<timestamp>/info_dispatches.log
+  summary: rocgdb_dump_bin_pid<pid>_<timestamp>/dump_summary.json
+view with: python3 queue_viewer.py <output_dir>/<file>.bin
 ```
-Each queue is saved as `hsa_QID<N>_GPU_<A>_Queue_<B>.log` / `dma_QID<N>_GPU_<A>_Queue_<B>.log`
-(also `xgmi_QID<N>_GPU_<A>_Queue_<B>.log` for XGMI-transport DMA queues) in that directory, decoded
-packet-by-packet as text. `<N>` is the same `(QID N)` shown by `info queue` (use that to
-cross-reference against CLR-side logs); `<A>`/`<B>` come from the queue's Target Id in `info queue`
-(`AMDGPU Queue <A>:<B> (QID N)`), e.g. Target Id `AMDGPU Queue 5:27 (QID 6)` -> `hsa_QID6_GPU_5_Queue_27.log`.
-Pass a directory name to control where it's written: `dump_all_queues /tmp/my_capture`. One
-bad/unreadable queue won't stop the rest of the batch; failures are reported in the summary.
+Each queue is saved as `hsa_QID<N>_GPU_<A>_Queue_<B>.bin` / `dma_QID<N>_GPU_<A>_Queue_<B>.bin`
+(also `xgmi_QID<N>_GPU_<A>_Queue_<B>.bin` for XGMI-transport DMA queues) in that directory. `<N>`
+is the same `(QID N)` shown by `info queue` (use that to cross-reference against CLR-side logs);
+`<A>`/`<B>` come from the queue's Target Id in `info queue` (`AMDGPU Queue <A>:<B> (QID N)`),
+e.g. Target Id `AMDGPU Queue 5:27 (QID 6)` -> `hsa_QID6_GPU_5_Queue_27.bin`. Pass a directory
+name to control where it's written: `dump_all_queues /tmp/my_capture`. One bad/unreadable queue
+won't stop the rest of the batch; failures are reported in the summary.
 
 Every run also writes:
 - `info_queues.log` / `info_dispatches.log` -- raw output of rocgdb's own `info queues` and
@@ -92,29 +96,6 @@ Every run also writes:
   any per-queue failures. Meant as a quick machine- or eyeball-readable manifest of the dump
   directory's contents, e.g. to confirm a batch capture actually got everything before archiving
   or sharing it.
-
-## Auto-dump everything, fast (binary + offline viewer)
-`dump_all_queues` decodes every packet to text *while attached live* -- on a hung process with
-large/many rings that's slow, since every packet is a separate round-trip over gdb's memory
-channel. `dump_all_queues_bin` instead reads each queue's raw bytes with a single bulk memory
-read (fast) and saves the queue's metadata (qid, type, address, rptr/wptr, size, ...) alongside
-the raw bytes in one `.bin` file per queue -- decode happens later, offline, against an
-in-memory buffer instead of over gdb:
-```
-(gdb) dump_all_queues_bin
-------------------------------
-dump_all_queues_bin complete: rocgdb_dump_bin_pid<pid>_<timestamp>
-  HSA queues captured: 20
-  DMA/XGMI queues captured: 8
-  backtraces: rocgdb_dump_bin_pid<pid>_<timestamp>/backtrace_all_threads.log
-  info queues: rocgdb_dump_bin_pid<pid>_<timestamp>/info_queues.log
-  info dispatches: rocgdb_dump_bin_pid<pid>_<timestamp>/info_dispatches.log
-  summary: rocgdb_dump_bin_pid<pid>_<timestamp>/dump_summary.json
-view with: python3 queue_viewer.py <output_dir>/<file>.bin
-```
-Same `<N>_<TargetId>` filename convention, `info_queues.log`/`info_dispatches.log` capture, and
-`dump_summary.json` as `dump_all_queues` above -- just `.bin` files instead of `.log` files for
-the per-queue ring data.
 
 Then, with **no gdb involved at all**, open any of those `.bin` files in the standalone
 `queue_viewer.py` and browse packets interactively:
@@ -155,7 +136,7 @@ the `rptr`/`wptr` commands themselves resolve (see the previous section for what
 means for DMA/XGMI specifically). Up/down-arrow command history works in the REPL via Python's
 `readline` module (imported automatically when available; degrades to plain `input()` if not).
 `queue_viewer.py` and `rocgdb_helper.py` share the exact same packet-decoding logic
-(`queue_decode.py`), so a `.bin` dump decodes identically to what `dump_all_queues`'s live
+(`queue_decode.py`), so a `.bin` dump decodes identically to what `dump_all_queues_txt`'s live
 text path would have shown for the same queue. Kernel dispatch packets show the raw
 `kernel_object` address only offline (no live process to resolve a symbol name against).
 
@@ -166,7 +147,7 @@ packets ever submitted to the queue, not a byte offset -- so the actual ring slo
 
 For **DMA/XGMI** (SDMA-engine) queues, `info queue` never reports Read/Write in the first
 place -- amd-dbgapi's packet-ID abstraction is HSA/AQL-specific and returns "not supported"
-for SDMA. `dump_all_queues`/`dump_all_queues_bin` instead make a **best-effort** attempt,
+for SDMA. `dump_all_queues`/`dump_all_queues_txt` instead make a **best-effort** attempt,
 every run, to fill these in by reading the queue's raw rptr/wptr straight out of KFD debugfs
 (see "SDMA rptr/wptr enrichment" below); when that succeeds, `rptr`/`wptr` navigation works
 for DMA/XGMI too, resolving to whichever decoded packet contains that ring position (SDMA
@@ -174,9 +155,29 @@ packets are variable-length, so there's no "packet ID" the way HSA has one -- se
 the exact units). When it doesn't (no root, non-KFD host, unrecognized GPU generation, or the
 queue just wasn't found), `rptr`/`wptr` print a one-line explanation instead of a value.
 
+## Auto-dump everything, text (live decode, slower)
+`dump_all_queues` reads each queue's raw bytes with a single bulk memory read and decodes them
+later, offline. `dump_all_queues_txt` instead decodes every packet to text *while attached
+live* -- on a hung process with large/many rings that's slow, since every packet is a separate
+round-trip over gdb's memory channel. Prefer `dump_all_queues` unless you specifically want
+plain-text `.log` files with no separate viewer step:
+```
+(gdb) dump_all_queues_txt
+------------------------------
+dump_all_queues_txt complete: rocgdb_dump_pid<pid>_<timestamp>
+  HSA queues captured: 20
+  DMA queues captured: 8
+  backtraces: rocgdb_dump_pid<pid>_<timestamp>/backtrace_all_threads.log
+  info queues: rocgdb_dump_pid<pid>_<timestamp>/info_queues.log
+  info dispatches: rocgdb_dump_pid<pid>_<timestamp>/info_dispatches.log
+  summary: rocgdb_dump_pid<pid>_<timestamp>/dump_summary.json
+```
+Same `<N>_<TargetId>` filename convention (`.log` instead of `.bin`), `info_queues.log`/
+`info_dispatches.log` capture, and `dump_summary.json` as `dump_all_queues` above.
+
 ### SDMA rptr/wptr enrichment
 
-Every `dump_all_queues`/`dump_all_queues_bin` run also tries, best-effort, to fill in
+Every `dump_all_queues`/`dump_all_queues_txt` run also tries, best-effort, to fill in
 Read/Write for DMA/XGMI rows by reading the SDMA queue's MQD (Memory Queue Descriptor)
 straight out of `/sys/kernel/debug/kfd/mqds` (root required, no `umr` binary needed) -- the
 same underlying data UMR's `--list-uq`/`--print-uq` are built on. The MQD carries two plain
@@ -231,7 +232,7 @@ conversion chain for this reason: `raw=N -> dword slot M -> byte offset 0x... ->
 
 ### SDMA packet decode
 
-`queue_decode.py`'s SDMA decoder (`decode_sdma_packets`, shared by the live `dump_all_queues`/
+`queue_decode.py`'s SDMA decoder (`decode_sdma_packets`, shared by the live `dump_all_queues_txt`/
 `dump_sdma_queue` and `queue_viewer.py`) is a port of UMR's own SDMA parsing source:
 
 - **Sizing** -- how many bytes each packet occupies, needed to find the next packet -- is a
@@ -330,7 +331,7 @@ suspect a barrier storm that isn't real). The reinterpreted fields are still sho
 title -- only the title changed.
 
 ### Browser UI instead of the REPL
-Same tool, `--web` instead of nothing, and point it at a whole `dump_all_queues_bin` output
+Same tool, `--web` instead of nothing, and point it at a whole `dump_all_queues` output
 directory instead of one file to browse every queue from one page:
 ```
 $ python3 queue_viewer.py rocgdb_dump_bin_pid.../ --web

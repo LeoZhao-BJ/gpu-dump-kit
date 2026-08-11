@@ -687,7 +687,7 @@ def _capture_gdb_command(out_dir, filename, command):
 
 def write_dump_summary(out_dir, summary):
     """Write dump_summary.json in out_dir, recording what kinds of data this
-    dump_all_queues/dump_all_queues_bin run actually captured (queue counts
+    dump_all_queues/dump_all_queues_txt run actually captured (queue counts
     and files by type, backtrace/info-command captures, failures)."""
     path = os.path.join(out_dir, "dump_summary.json")
     try:
@@ -703,17 +703,21 @@ def write_dump_summary(out_dir, summary):
 class DumpAllQueues(gdb.Command):
     """Automatically dump every HSA/DMA queue (full ring, text decode) plus
     all-thread backtraces into a directory -- no manual info-queue copy/paste.
+    Decodes every packet to text while attached live -- see dump_all_queues
+    (the binary/fast dump command) for a much faster alternative on a hung
+    process, since this one round-trips through gdb's memory channel
+    packet-by-packet.
 
-    dump_all_queues [output_dir]
+    dump_all_queues_txt [output_dir]
     """
 
     def __init__(self):
-        super(DumpAllQueues, self).__init__("dump_all_queues", gdb.COMMAND_USER)
+        super(DumpAllQueues, self).__init__("dump_all_queues_txt", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         args = gdb.string_to_argv(arg)
         if len(args) > 1:
-            print("usage: dump_all_queues [output_dir]")
+            print("usage: dump_all_queues_txt [output_dir]")
             return
 
         try:
@@ -819,7 +823,7 @@ class DumpAllQueues(gdb.Command):
         summary_path = write_dump_summary(
             out_dir,
             {
-                "command": "dump_all_queues",
+                "command": "dump_all_queues_txt",
                 "output_dir": out_dir,
                 "pid": pid,
                 "comm": comm,
@@ -842,7 +846,7 @@ class DumpAllQueues(gdb.Command):
         )
 
         print("-" * 30)
-        print(f"dump_all_queues complete: {out_dir}")
+        print(f"dump_all_queues_txt complete: {out_dir}")
         print(f"  HSA queues captured: {hsa_count}")
         print(f"  DMA queues captured: {dma_count}")
         if failures:
@@ -866,19 +870,19 @@ class DumpAllQueuesBinary(gdb.Command):
     """Fast binary capture: dump every HSA/DMA/XGMI queue's raw bytes (one
     bulk read per queue, no live packet decode) plus per-queue metadata,
     into one .bin file per queue -- decode them later, offline, with
-    queue_viewer.py. Much faster than dump_all_queues on a hung process,
+    queue_viewer.py. Much faster than dump_all_queues_txt on a hung process,
     since nothing round-trips through gdb's memory channel packet-by-packet.
 
-    dump_all_queues_bin [output_dir]
+    dump_all_queues [output_dir]
     """
 
     def __init__(self):
-        super(DumpAllQueuesBinary, self).__init__("dump_all_queues_bin", gdb.COMMAND_USER)
+        super(DumpAllQueuesBinary, self).__init__("dump_all_queues", gdb.COMMAND_USER)
 
     def invoke(self, arg, from_tty):
         args = gdb.string_to_argv(arg)
         if len(args) > 1:
-            print("usage: dump_all_queues_bin [output_dir]")
+            print("usage: dump_all_queues [output_dir]")
             return
 
         try:
@@ -989,7 +993,7 @@ class DumpAllQueuesBinary(gdb.Command):
         summary_path = write_dump_summary(
             out_dir,
             {
-                "command": "dump_all_queues_bin",
+                "command": "dump_all_queues",
                 "output_dir": out_dir,
                 "pid": pid,
                 "comm": comm,
@@ -1012,7 +1016,7 @@ class DumpAllQueuesBinary(gdb.Command):
         )
 
         print("-" * 30)
-        print(f"dump_all_queues_bin complete: {out_dir}")
+        print(f"dump_all_queues complete: {out_dir}")
         print(f"  HSA queues captured: {hsa_count}")
         print(f"  DMA/XGMI queues captured: {dma_count}")
         if failures:

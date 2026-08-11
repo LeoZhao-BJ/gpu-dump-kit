@@ -9,7 +9,7 @@ lists concrete commands plus expected output.
 Real `.bin`/`.log` dump directories referenced below (e.g.
 `rocgdb_dump_bin_pid.../`) are examples from past test sessions and may no
 longer exist by the time you read this -- if so, regenerate fresh ones with
-`dump_all_queues_bin` per "0. Baseline smoke test" below before running the
+`dump_all_queues` per "0. Baseline smoke test" below before running the
 sections that need real data.
 
 ---
@@ -22,21 +22,25 @@ python3 -m py_compile rocgdb_helper.py queue_decode.py queue_viewer.py && echo C
 rocgdb -q -batch -x rocgdb_helper.py -ex "help user-defined" 2>&1
 ```
 **Expect:** `COMPILE_OK`, and all 8 commands listed cleanly (`dump_all_queues`,
-`dump_all_queues_bin`, `dump_hsa_queue`, `dump_hsa_queue_search`,
+`dump_all_queues_txt`, `dump_hsa_queue`, `dump_hsa_queue_search`,
 `dump_hsa_signal`, `dump_queue_memory`, `dump_sdma_queue`,
-`modify_hsa_signal`) with no traceback.
+`modify_hsa_signal`) with no traceback. `dump_all_queues` is the fast binary
+capture (`.bin` files, decode later offline); `dump_all_queues_txt` is the
+slower live-decode-to-text version (`.log` files) -- see README for the
+distinction (this naming was swapped in an August 2026 session; older
+dumps/scripts referencing `dump_all_queues_bin` predate the swap).
 
 Generate fresh real test data (needs a live ROCm process -- `hip_deadlock`
 test binary or any HIP program works):
 ```bash
 sudo rocgdb attach <pid>
 (gdb) source rocgdb_helper.py
-(gdb) dump_all_queues_bin
+(gdb) dump_all_queues
 ```
 
 ---
 
-## 1. `dump_all_queues` / `dump_all_queues_bin` -- summary + info capture
+## 1. `dump_all_queues` / `dump_all_queues_txt` -- summary + info capture
 
 **Feature:** every run writes `dump_summary.json`, `info_queues.log`,
 `info_dispatches.log` alongside the per-queue files.
