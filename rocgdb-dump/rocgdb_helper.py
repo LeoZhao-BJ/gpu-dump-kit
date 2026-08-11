@@ -945,11 +945,7 @@ class DumpAllQueues(gdb.Command):
                     def emit(line, _f=f):
                         _f.write(str(line) + "\n")
 
-                    emit(f"# {row['target_id']}")
-                    emit(
-                        f"Dumping full ring for {label} type={qtype} "
-                        f"addr=0x{addr:x} size={size} read={row['read']} write={row['write']}"
-                    )
+                    qd.write_dump_txt_header(emit, row)
                     if qtype == "HSA":
                         decode_hsa_queue(inferior, addr, 0, size // 64, emit=emit)
                         hsa_count += 1

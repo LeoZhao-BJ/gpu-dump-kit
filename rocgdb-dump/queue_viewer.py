@@ -10,6 +10,11 @@ Usage:
     python3 queue_viewer.py <dump.bin>              # interactive REPL, one file
     python3 queue_viewer.py <dir_of_dumps>           # REPL with 'list'/'use' to switch queues
     python3 queue_viewer.py <dir_or_file> --web      # browser UI (localhost only by default)
+    python3 queue_viewer.py <dir_or_file> --to-txt [--outdir DIR]
+                                                     # offline .bin -> .log conversion, no REPL/
+                                                     # gdb at all -- matches dump_all_queues_txt's
+                                                     # own .log format exactly (see
+                                                     # queue_decode.write_dump_txt_header)
 
 REPL prompt commands (up/down-arrow command history via readline, when
 available):
@@ -475,6 +480,56 @@ def list_bin_files(path):
         names = sorted(f for f in os.listdir(path) if f.endswith(".bin"))
         return [(n, os.path.join(path, n)) for n in names]
     return [(os.path.basename(path), path)]
+
+
+def run_to_txt(path, outdir=None):
+    """Offline .bin -> .log conversion: no gdb, no live process -- just
+    QueueDump's already-existing decode pipeline (the same one the REPL's
+    'all' command and --web use), batch-run over every .bin file found by
+    list_bin_files() and written out in the exact same text format
+    rocgdb_helper.py's live dump_all_queues_txt produces (shared header via
+    queue_decode.write_dump_txt_header, so a .log produced this way is
+    indistinguishable from one produced live for the same queue).
+
+    Naming: <name>.bin -> <name>.log, in `outdir` if given, else alongside
+    each source .bin file. One bad/corrupt .bin doesn't stop the rest of the
+    batch, matching dump_all_queues' own per-queue failure handling."""
+    files = list_bin_files(path)
+    if not files:
+        print(f"No .bin files found under {path}", file=sys.stderr)
+        return 1
+
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+
+    converted = 0
+    failures = []
+    for name, filepath in files:
+        out_name = name[:-4] + ".log" if name.endswith(".bin") else name + ".log"
+        out_path = os.path.join(outdir, out_name) if outdir else os.path.join(
+            os.path.dirname(filepath), out_name
+        )
+        try:
+            dump = QueueDump(filepath)  # use_color=False (default) -- these are saved files
+            with open(out_path, "w") as f:
+                def emit(line, _f=f):
+                    _f.write(str(line) + "\n")
+
+                qd.write_dump_txt_header(emit, dump.metadata)
+                dump.print_packets(0, dump.packet_count(), emit=emit)
+        except (OSError, ValueError) as e:
+            failures.append((name, str(e)))
+            print(f"Failed to convert {name}: {e}", file=sys.stderr)
+            continue
+        print(f"{name} -> {out_path}")
+        converted += 1
+
+    print(f"Converted {converted} of {len(files)} dump(s) to text.")
+    if failures:
+        print(f"  failures: {len(failures)}")
+        for name, err in failures:
+            print(f"    {name}: {err}")
+    return 1 if failures and converted == 0 else 0
 
 
 def _peek_dump_metadata(path):
@@ -1006,10 +1061,21 @@ def main():
     parser.add_argument("--web", action="store_true", help="serve a browser UI instead of the REPL")
     parser.add_argument("--host", default="127.0.0.1", help="--web bind address (default: 127.0.0.1, localhost only)")
     parser.add_argument("--port", type=int, default=8765, help="--web bind port (default: 8765)")
+    parser.add_argument(
+        "--to-txt", action="store_true",
+        help="offline .bin -> .log conversion instead of the REPL/--web (see --outdir)",
+    )
+    parser.add_argument(
+        "--outdir", default=None,
+        help="--to-txt output directory (default: alongside each source .bin file)",
+    )
     args = parser.parse_args()
 
     if args.web:
         return run_web(args.path, args.host, args.port)
+
+    if args.to_txt:
+        return run_to_txt(args.path, args.outdir)
 
     if os.path.isdir(args.path):
         return run_repl_dir(args.path)

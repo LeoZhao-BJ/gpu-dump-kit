@@ -284,7 +284,32 @@ Same `<N>_<TargetId>` filename convention (`.log` instead of `.bin`), `info_queu
 --txt <pid>` runs this instead of the default, if you want the one-shot script's convenience
 with this variant.
 
-### 2.5 Manual, one queue at a time (most advanced)
+### 2.5 Converting an existing `.bin` capture to text, offline
+
+Already have a `dump_all_queues` (binary) capture and want the same plain-text `.log` files
+`dump_all_queues_txt` would have produced, without re-attaching to the process at all? `queue_viewer.py
+--to-txt` converts them **offline** -- no gdb, no live process, just the same decode pipeline the
+REPL/`--web` already use, batch-run over every `.bin` file and written out in the exact same
+format `dump_all_queues_txt` uses (shared via `queue_decode.write_dump_txt_header`, so a `.log`
+produced this way reads identically to one produced live for the same queue):
+```
+$ python3 queue_viewer.py rocgdb_dump_bin_pid.../ --to-txt
+dma_QID4_GPU_8_Queue_2.bin -> rocgdb_dump_bin_pid.../dma_QID4_GPU_8_Queue_2.log
+hsa_QID0_GPU_8_Queue_6.bin -> rocgdb_dump_bin_pid.../hsa_QID0_GPU_8_Queue_6.log
+...
+Converted 6 of 6 dump(s) to text.
+```
+Works against a single `.bin` file or a whole directory (same `list_bin_files` used by `--web`).
+Writes each `<name>.log` alongside its source `<name>.bin` by default; pass `--outdir DIR` to
+write elsewhere instead. Doesn't touch `info_queues.log`/`info_dispatches.log`/
+`dump_summary.json`/`backtrace_all_threads.log` -- those already exist from the original
+`dump_all_queues` run this is converting; only the per-queue packet-decode text is regenerated.
+One bad/corrupt `.bin` doesn't stop the rest of the batch (reported as a failure, same
+"don't let one bad queue abort the whole thing" philosophy as `dump_all_queues` itself). Same
+known asymmetry as browsing offline elsewhere in this doc: kernel dispatch packets show the raw
+`kernel_object` address only (no live process to resolve a symbol name against).
+
+### 2.6 Manual, one queue at a time (most advanced)
 
 For anything not covered by the automatic paths above -- inspecting one specific queue/signal by
 hand, or walking a thread's stack to find a doorbell signal address -- the original granular
@@ -488,8 +513,10 @@ $4 = (hsa_queue_t *) 0x7f0757fde000
   directory's queues, full parity including `rp`/`wp` expressions, JSON errors (400/404)
   instead of tracebacks, binds to localhost only by default (see 2.2). Same `PENDING`
   highlighting as the REPL's `list`, shown as a red-bordered card + badge in the sidebar.
+- **`queue_viewer.py --to-txt`** -- offline `.bin` -> `.log` conversion, no gdb/live process
+  involved, matching `dump_all_queues_txt`'s own text format exactly (see 2.5).
 - **Manual, one-at-a-time commands** -- `dump_hsa_queue`, `dump_sdma_queue`,
-  `dump_hsa_signal`, `modify_hsa_signal`, `dump_queue_memory` (see 2.5), original commands from
+  `dump_hsa_signal`, `modify_hsa_signal`, `dump_queue_memory` (see 2.6), original commands from
   the upstream `rocgdb_info` project this repo grew out of.
 
 ### TODO / known limitations

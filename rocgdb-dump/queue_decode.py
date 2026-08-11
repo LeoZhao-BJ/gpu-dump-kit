@@ -73,6 +73,24 @@ def read_dump_header(f):
         raise ValueError(f"Corrupt dump header: {e}")
 
 
+def write_dump_txt_header(emit, metadata):
+    """Emit the two header lines that precede a queue's full packet decode in
+    a `dump_all_queues_txt`-style text dump: `# <target_id>` then a
+    `Dumping full ring for QID<n> type=... addr=... size=... read=...
+    write=...` summary line. Shared by rocgdb_helper.py's live
+    dump_all_queues_txt (writing straight to a .log file while attached) and
+    queue_viewer.py's offline `--to-txt` (.bin -> .log conversion with no
+    gdb involved) so the two can never format-drift apart -- a `.log`
+    produced live and one produced by converting the matching `.bin` later
+    should read identically."""
+    emit(f"# {metadata['target_id']}")
+    emit(
+        f"Dumping full ring for QID{metadata['qid']} type={metadata['type']} "
+        f"addr=0x{metadata['addr']:x} size={metadata['size']} "
+        f"read={metadata['read']} write={metadata['write']}"
+    )
+
+
 def _hsa_decode_fields(words, symbol_lookup):
     """Decode one 64-byte HSA AQL packet's fields. `words[i]` is the dword
     at byte offset 4*i -- unlike the SDMA decoder, HSA's own header dword

@@ -723,6 +723,62 @@ sudo rm -rf /tmp/dump_script_test dump_all_queues_pid*.log   # cleanup (root-own
 
 ---
 
+## 12. `queue_viewer.py --to-txt` offline `.bin` -> `.log` conversion
+
+**Feature:** convert an existing `dump_all_queues` (binary) capture to the
+same plain-text format `dump_all_queues_txt` would have produced, entirely
+offline -- no gdb, no live process. Shares the exact two-line header format
+(`queue_decode.write_dump_txt_header`) with the live writer, so the two
+paths can never format-drift apart.
+
+- [ ] `python3 queue_viewer.py <one>.bin --to-txt` writes `<one>.log`
+      alongside the source file; `python3 queue_viewer.py <dir> --to-txt`
+      converts every `.bin` file found (same `list_bin_files` used by
+      `--web`), printing a per-file `<name>.bin -> <path>.log` line and a
+      `Converted N of M dump(s) to text.` summary.
+- [ ] `--outdir DIR` writes there instead (created if missing); without it,
+      each `.log` lands next to its source `.bin`.
+- [ ] Generated `.log` starts with exactly `# <target_id>` then
+      `Dumping full ring for QID<n> type=<TYPE> addr=0x<hex> size=<n>
+      read=<r> write=<w>`, matching `rocgdb_helper.py`'s live
+      `dump_all_queues_txt` output byte-for-byte for the same queue
+      (`rocgdb_helper.py`'s per-queue writer now calls the same
+      `qd.write_dump_txt_header()` instead of duplicating the format
+      string -- confirm both call sites produce identical header lines).
+- [ ] Body after the header is identical to what `packet_count()`-many
+      `packet`/`range`/`all` would show for that file in the REPL -- no
+      ANSI color codes in the output file (`QueueDump` is constructed
+      without `use_color`, so it defaults to `False` regardless of whether
+      the conversion is run from a real terminal).
+- [ ] Empty directory (no `.bin` files): prints `No .bin files found under
+      <dir>` to stderr, exits 1 -- no traceback.
+- [ ] One bad/corrupt/unreadable `.bin` in a batch doesn't stop the rest --
+      reported under `failures:` in the summary, other files still convert;
+      exit code is 1 only if **zero** files converted, 0 if at least one did.
+- [ ] Doesn't touch/require `info_queues.log`/`info_dispatches.log`/
+      `dump_summary.json`/`backtrace_all_threads.log` -- this only
+      regenerates the per-queue packet-decode text.
+
+```bash
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+DUMP_DIR=$(ls -d rocgdb_dump_bin_pid*/ | head -1)
+
+# whole-directory conversion to a scratch dir (avoids permission issues if
+# DUMP_DIR is root-owned from an earlier `sudo rocgdb` run)
+rm -rf /tmp/qv_txt_test
+python3 queue_viewer.py "$DUMP_DIR" --to-txt --outdir /tmp/qv_txt_test
+grep -rl $'\x1b' /tmp/qv_txt_test/ 2>/dev/null && echo "FAIL: ANSI leaked into a .log file" || echo "OK: no ANSI in any .log file"
+head -2 /tmp/qv_txt_test/hsa_*.log | head -6   # spot-check the header format
+rm -rf /tmp/qv_txt_test
+
+# empty directory
+mkdir -p /tmp/qv_txt_empty && python3 queue_viewer.py /tmp/qv_txt_empty --to-txt; echo "exit=$?"
+# expect: "No .bin files found under /tmp/qv_txt_empty", exit=1
+rmdir /tmp/qv_txt_empty
+```
+
+---
+
 ## Quick full-regression one-liner
 
 Run after any change to `rocgdb_helper.py`/`queue_decode.py`/`queue_viewer.py`:
