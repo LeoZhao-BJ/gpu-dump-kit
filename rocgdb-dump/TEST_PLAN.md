@@ -189,10 +189,10 @@ Agent Dispatch, Invalid/Unknown -- same rendering core as SDMA
       guessed reinterpreted type (`KERNEL_DISPATCH`/`BARRIER_AND`) -- this
       was a real bug found via real data where an entire 16384-packet ring
       of already-consumed/idle slots was mislabeled as live barrier traffic.
-      The reinterpreted fields are still shown below the title, with a
-      `(invalid packet, reinterpreted as type N)` note right before
-      `COMPLETION_SIGNAL` (must NOT sit between `HEADER` and `SETUP`/`TYPE`
-      -- that would duplicate word 0's hex row, a bug that was caught and fixed).
+      The reinterpreted fields are still shown below the title (silently --
+      no `(invalid packet, reinterpreted as type N)` note line; that note
+      was removed per user request since the `INVALID` title already says
+      everything that matters).
 - [ ] Replay against a real captured HSA `.bin` (16k+ packets) -- zero
       decode errors across the whole ring.
 - [ ] `rptr`/`wptr` jump navigation still works for HSA after all the
@@ -257,25 +257,34 @@ print('OK: all pipes aligned at column 35')
 ## 7. `queue_viewer.py` REPL: history + wptr/rptr expressions
 
 **Feature:** up/down-arrow command history (via `readline`); `packet`/
-`range`/`raw` accept `rptr`/`wptr` (optionally `+N`/`-N`) as index arguments.
+`range`/`raw` accept `rptr`/`wptr` (optionally `+N`/`-N`) as index arguments;
+`range` also has a one-letter alias `r` (matching `packet`'s `p`).
 
 - [ ] `import readline` succeeds without error on this host (or degrades
       silently via `except ImportError: pass` where unavailable).
 - [ ] `packet wptr` == `packet <resolved wptr index>` (same output).
 - [ ] `range rptr rptr+1` decodes exactly 2 packets (rptr's index and the
-      next one).
+      next one); `r rptr rptr+1` produces identical output.
 - [ ] `raw wptr-1` hex-dumps the packet immediately before the write pointer.
 - [ ] Invalid token (e.g. `packet notaptr`) still produces a clean
       `error: invalid literal for int() with base 0: 'notaptr'` -- no traceback.
-- [ ] `rptr`/`wptr` alone (bare commands) still work unchanged (jump +
-      print, with the full diagnostic message: `raw=N -> dword slot M ->
-      byte offset 0x... -> packet index K (of TOTAL)` for SDMA, `raw=N ->
-      slot index K (of TOTAL)` for HSA).
+- [ ] **`rptr`/`wptr` alone (bare commands) must not crash when the pointer
+      actually resolves to a real index** -- regression test for a real bug:
+      `_resolve_pointer`'s HSA success path once returned a dict with no
+      `"reason"` key, and `jump_to_pointer`'s `info["reason"]` lookup raised
+      `KeyError: 'reason'` on *every successful* `wptr`/`rptr` (only the
+      already-handled "missing"/"empty" paths worked) -- fixed by adding
+      `"reason": None` to that return and switching all reads to
+      `info.get("reason")`. Confirm bare `wptr`/`rptr` print the full
+      diagnostic message and the packet, with no traceback: `raw=N -> dword
+      slot M -> byte offset 0x... -> packet index K (of TOTAL)` for SDMA,
+      `raw=N -> slot index K (of TOTAL)` for HSA.
 - [ ] These expressions work for **both** HSA and DMA/XGMI dumps.
 
 ```bash
-printf 'wptr\npacket wptr\nrange rptr rptr+1\nraw wptr-1\npacket notaptr\nquit\n' \
+printf 'wptr\nrptr\npacket wptr\nrange rptr rptr+1\nr rptr rptr+1\nraw wptr-1\npacket notaptr\nquit\n' \
   | python3 queue_viewer.py <any>.bin
+# expect: no "KeyError" / "Traceback" anywhere in the output
 ```
 
 ---
@@ -301,6 +310,61 @@ wrapping to a ring-relative position happens at use time in
 # synthetic multi-wrap test (see section 4's harness for building a fake
 # ring); set metadata['write'] = ring_size_dwords * 3 + 2 and confirm
 # jump_to_pointer resolves to dword slot 2, not a huge/wrong number.
+```
+
+---
+
+## 9. `queue_viewer.py --web` browser UI (parity with the REPL)
+
+**Feature:** the browser UI is a thin HTTP wrapper around the exact same
+`QueueDump` methods the REPL calls -- every endpoint below must produce
+output identical (line-for-line) to the equivalent REPL command, not just
+"similar".
+
+- [ ] `GET /` serves the HTML page (200, `Content-Type: text/html`); the
+      page's `#src` element shows the absolute path the server was pointed
+      at (`os.path.abspath(path)`), and contains no leftover
+      `__ROOT_PATH_JSON__` template marker.
+- [ ] `GET /api/list` returns one entry per `.bin` file with
+      `name`/`qid`/`type`/`size`/`target_id`/`count` (`count` is
+      `packet_count()` -- full ring walk for SDMA/XGMI, `size/64` for HSA);
+      a file that fails to load (bad header, truncated) gets `{"name":...,
+      "error": "..."}` instead of killing the whole listing.
+- [ ] `GET /api/help` returns `{"lines": [...]}` matching `HELP_TEXT.splitlines()`
+      -- single source of truth with the REPL's `help` command, not a
+      hand-duplicated copy in the JS.
+- [ ] `GET /api/queue/<name>/info` output == REPL `info` output for the same file.
+- [ ] `GET /api/queue/<name>/packet/<n>`, `.../range/<a>/<b>`, `.../raw/<n>`,
+      `.../rptr`, `.../wptr` all match the REPL's `packet`/`range`/`raw`/
+      `rptr`/`wptr` output for the same arguments.
+- [ ] **Parity gap this section exists to close:** `packet`/`range`/`raw`
+      accept `rptr`/`wptr` (optionally `+N`/`-N`) exactly like the REPL --
+      e.g. `.../packet/wptr-1`, `.../range/rptr/rptr%2B2` (the `%2B` is
+      what `encodeURIComponent('rptr+2')` produces; the server
+      percent-decodes every path segment, not just the queue name, then
+      parses it the same way `_parse_index` does for the REPL).
+- [ ] `GET /api/queue/<name>/packet/notaptr` -> HTTP 400, JSON `{"error": "..."}`
+      (not 500, not an unhandled traceback in the server log).
+- [ ] `GET /api/queue/does_not_exist.bin/info` -> HTTP 404, JSON `{"error": "..."}`.
+- [ ] `.../all` is capped at `_WEB_ALL_CAP` (2000) packets with a trailing
+      `... capped at 2000 of N packets ...` line when the ring is bigger;
+      uncapped for rings <= 2000 packets.
+- [ ] Server binds to `127.0.0.1` by default (not reachable from other
+      hosts) unless `--host` is passed explicitly.
+- [ ] Sidebar shows a type badge (HSA/DMA/XGMI, distinct colors) and the
+      packet count per queue, and clicking an item auto-runs `info` for it.
+
+```bash
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+python3 queue_viewer.py <dump_dir_or_file> --web --port 8799 &
+SERVER_PID=$!
+sleep 1
+NAME=$(python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8799/api/list'))[0]['name'])")
+curl -s http://127.0.0.1:8799/ | grep -q '__ROOT_PATH_JSON__' && echo "FAIL: marker not substituted" || echo "OK: marker substituted"
+curl -s "http://127.0.0.1:8799/api/queue/$NAME/packet/wptr-1" | python3 -m json.tool | head -5
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/queue/$NAME/packet/notaptr"   # expect 400
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/queue/nope.bin/info"           # expect 404
+kill $SERVER_PID
 ```
 
 ---

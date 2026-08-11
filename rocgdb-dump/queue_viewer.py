@@ -451,33 +451,100 @@ _INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <title>queue_viewer</title>
 <style>
-  body { font-family: monospace; margin: 0; display: flex; height: 100vh; }
-  #sidebar { width: 320px; overflow-y: auto; border-right: 1px solid #ccc; padding: 8px; box-sizing: border-box; }
-  #main { flex: 1; display: flex; flex-direction: column; padding: 8px; box-sizing: border-box; min-width: 0; }
-  #controls { margin-bottom: 8px; }
-  #controls button, #controls input { font-family: monospace; margin: 2px; }
-  #output { flex: 1; overflow: auto; background: #111; color: #ddd; padding: 8px; white-space: pre-wrap; }
-  .qitem { padding: 4px; cursor: pointer; border-bottom: 1px solid #eee; }
-  .qitem:hover { background: #f0f0f0; }
-  .qitem.selected { background: #dbe9ff; }
-  .qtype { color: #666; font-size: 0.85em; }
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --border: #dde1e6; --text: #1c2128;
+    --muted: #6b7280; --accent: #2563eb; --accent-bg: #eaf1ff;
+    --hsa: #2563eb; --dma: #059669; --xgmi: #7c3aed;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --ui: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--ui); margin: 0; height: 100vh; display: flex; flex-direction: column; color: var(--text); background: var(--bg); }
+  #appbar { flex: none; display: flex; align-items: baseline; gap: 10px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  #appbar h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #appbar .src { font-size: 12px; color: var(--muted); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #appbar .spacer { flex: 1; }
+  #appbar button { font-family: var(--ui); }
+  #body { flex: 1; display: flex; min-height: 0; }
+  #sidebar { width: 300px; flex: none; overflow-y: auto; border-right: 1px solid var(--border); background: var(--panel); }
+  #qlist { padding: 6px; }
+  #main { flex: 1; display: flex; flex-direction: column; padding: 12px; min-width: 0; }
+  #title { font-size: 14px; margin-bottom: 10px; color: var(--muted); }
+  #title b { color: var(--text); font-family: var(--mono); }
+  #controls { margin-bottom: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+  .row label { color: var(--muted); font-size: 12px; width: 46px; }
+  button {
+    font-family: var(--ui); font-size: 13px; padding: 5px 12px; margin: 0;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text); cursor: pointer;
+  }
+  button:hover { background: var(--accent-bg); border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { filter: brightness(1.08); }
+  input[type=text] {
+    font-family: var(--mono); font-size: 13px; padding: 5px 8px; width: 130px;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  input[type=text]:focus, button:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #output {
+    flex: 1; overflow: auto; background: #0d1117; color: #d8dee9; padding: 12px 14px;
+    white-space: pre; font-family: var(--mono); font-size: 13px; line-height: 1.45;
+    border-radius: 8px; border: 1px solid var(--border);
+  }
+  #output.empty { color: #6b7280; white-space: pre-wrap; font-family: var(--ui); }
+  .qitem { padding: 8px 10px; margin: 3px 4px; cursor: pointer; border-radius: 6px; border: 1px solid transparent; }
+  .qitem:hover { background: var(--bg); }
+  .qitem.selected { background: var(--accent-bg); border-color: var(--accent); }
+  .qname { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .qmeta { color: var(--muted); font-size: 11px; margin-top: 3px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; color: #fff; letter-spacing: 0.02em; }
+  .badge.hsa { background: var(--hsa); }
+  .badge.dma { background: var(--dma); }
+  .badge.xgmi { background: var(--xgmi); }
+  .badge.err { background: #dc2626; }
+  #empty-hint { padding: 30px 8px; color: var(--muted); font-size: 13px; }
 </style>
 </head>
 <body>
-<div id="sidebar"><div id="qlist">loading...</div></div>
-<div id="main">
-  <div id="title"><b>No queue selected</b></div>
-  <div id="controls">
-    <button onclick="doInfo()">info</button>
-    <button onclick="doAll()">all</button>
-    <button onclick="doRptr()">rptr</button>
-    <button onclick="doWptr()">wptr</button>
-    <br>
-    packet <input id="pkt" size="6"><button onclick="doPacket()">go</button>
-    range <input id="rangeA" size="6"> <input id="rangeB" size="6"><button onclick="doRange()">go</button>
-    raw <input id="rawn" size="6"><button onclick="doRaw()">go</button>
+<div id="appbar">
+  <h1>queue_viewer</h1>
+  <span class="src" id="src"></span>
+  <span class="spacer"></span>
+  <button onclick="doHelp()" title="command reference">help</button>
+</div>
+<div id="body">
+  <div id="sidebar"><div id="qlist">loading...</div></div>
+  <div id="main">
+    <div id="title"><b>No queue selected</b> -- pick one from the sidebar</div>
+    <div id="controls">
+      <div class="row">
+        <button onclick="doInfo()">info</button>
+        <button onclick="doAll()">all</button>
+        <button class="primary" onclick="doRptr()">rptr</button>
+        <button class="primary" onclick="doWptr()">wptr</button>
+      </div>
+      <div class="row">
+        <label>packet</label>
+        <input type="text" id="pkt" placeholder="N or wptr-1" onkeydown="if(event.key==='Enter')doPacket()">
+        <button onclick="doPacket()">go</button>
+      </div>
+      <div class="row">
+        <label>range</label>
+        <input type="text" id="rangeA" placeholder="rptr" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
+        <input type="text" id="rangeB" placeholder="wptr+5" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
+        <button onclick="doRange()">go</button>
+      </div>
+      <div class="row">
+        <label>raw</label>
+        <input type="text" id="rawn" placeholder="N or rptr" onkeydown="if(event.key==='Enter')doRaw()">
+        <button onclick="doRaw()">go</button>
+      </div>
+    </div>
+    <div id="output" class="empty">Pick a queue on the left, then use the buttons above (or 'help' for the
+full command reference -- N/A/B accept a plain integer or rptr/wptr optionally followed by +N/-N,
+e.g. "wptr-1" or "range rptr rptr+5").</div>
   </div>
-  <div id="output"></div>
 </div>
 <script>
 let current = null;
@@ -488,23 +555,36 @@ function api(path) {
 
 function show(obj) {
   const out = document.getElementById('output');
+  out.classList.remove('empty');
   if (obj.error) { out.textContent = 'error: ' + obj.error; return; }
   out.textContent = (obj.lines || []).join('\\n');
+}
+
+function badgeClass(type) {
+  const t = (type || '').toLowerCase();
+  return (t === 'hsa' || t === 'dma' || t === 'xgmi') ? t : 'err';
 }
 
 function loadList() {
   api('/api/list').then(items => {
     const qlist = document.getElementById('qlist');
     qlist.innerHTML = '';
+    if (!items.length) {
+      qlist.innerHTML = '<div id="empty-hint">no .bin dumps found</div>';
+      return;
+    }
     items.forEach(it => {
       const div = document.createElement('div');
       div.className = 'qitem';
       div.dataset.name = it.name;
       if (it.error) {
-        div.innerHTML = '<div>' + it.name + '</div><div class="qtype">error: ' + it.error + '</div>';
+        div.innerHTML = '<div class="qname">' + it.name + '</div>' +
+          '<div class="qmeta"><span class="badge err">error</span>' + it.error + '</div>';
       } else {
-        div.innerHTML = '<div>' + it.name + '</div><div class="qtype">qid=' + it.qid +
-          ' type=' + it.type + ' size=' + it.size + '</div>';
+        const count = (it.count === null || it.count === undefined) ? '?' : it.count;
+        div.innerHTML = '<div class="qname">' + it.name + '</div>' +
+          '<div class="qmeta"><span class="badge ' + badgeClass(it.type) + '">' + it.type + '</span>' +
+          'qid ' + it.qid + ' &middot; ' + count + ' pkt &middot; ' + it.size + ' B</div>';
       }
       div.onclick = () => selectQueue(it.name);
       qlist.appendChild(div);
@@ -526,26 +606,33 @@ function need() {
   return true;
 }
 
-function doInfo()  { if (need()) api('/api/queue/' + encodeURIComponent(current) + '/info').then(show); }
-function doAll()   { if (need()) api('/api/queue/' + encodeURIComponent(current) + '/all').then(show); }
-function doRptr()  { if (need()) api('/api/queue/' + encodeURIComponent(current) + '/rptr').then(show); }
-function doWptr()  { if (need()) api('/api/queue/' + encodeURIComponent(current) + '/wptr').then(show); }
+function q(path) { return '/api/queue/' + encodeURIComponent(current) + path; }
+
+function doHelp()  { api('/api/help').then(show); }
+function doInfo()  { if (need()) api(q('/info')).then(show); }
+function doAll()   { if (need()) api(q('/all')).then(show); }
+function doRptr()  { if (need()) api(q('/rptr')).then(show); }
+function doWptr()  { if (need()) api(q('/wptr')).then(show); }
 function doPacket() {
   if (!need()) return;
-  const n = document.getElementById('pkt').value;
-  api('/api/queue/' + encodeURIComponent(current) + '/packet/' + n).then(show);
+  const n = document.getElementById('pkt').value.trim();
+  if (!n) return;
+  api(q('/packet/' + encodeURIComponent(n))).then(show);
 }
 function doRange() {
   if (!need()) return;
-  const a = document.getElementById('rangeA').value, b = document.getElementById('rangeB').value;
-  api('/api/queue/' + encodeURIComponent(current) + '/range/' + a + '/' + b).then(show);
+  const a = document.getElementById('rangeA').value.trim(), b = document.getElementById('rangeB').value.trim();
+  if (!a || !b) return;
+  api(q('/range/' + encodeURIComponent(a) + '/' + encodeURIComponent(b))).then(show);
 }
 function doRaw() {
   if (!need()) return;
-  const n = document.getElementById('rawn').value;
-  api('/api/queue/' + encodeURIComponent(current) + '/raw/' + n).then(show);
+  const n = document.getElementById('rawn').value.trim();
+  if (!n) return;
+  api(q('/raw/' + encodeURIComponent(n))).then(show);
 }
 
+document.getElementById('src').textContent = __ROOT_PATH_JSON__;
 loadList();
 </script>
 </body>
@@ -554,8 +641,9 @@ loadList();
 
 
 class _QueueWebState:
-    def __init__(self, files):
+    def __init__(self, files, root_path=""):
         self.files = dict(files)  # name -> path
+        self.root_path = root_path  # the dir/file the server was pointed at, for display only
         self._dumps = {}
 
     def get(self, name):
@@ -570,6 +658,10 @@ class _QueueWebState:
         for name in self.files:
             try:
                 d = self.get(name)
+                try:
+                    count = d.packet_count()
+                except Exception:
+                    count = None  # e.g. truncated dump -- info/raw may still work
                 out.append(
                     {
                         "name": name,
@@ -577,6 +669,7 @@ class _QueueWebState:
                         "type": d.metadata.get("type"),
                         "size": d.metadata.get("size"),
                         "target_id": d.metadata.get("target_id"),
+                        "count": count,
                     }
                 )
             except Exception as e:
@@ -587,6 +680,8 @@ class _QueueWebState:
 def _make_handler(state):
     import http.server
     import urllib.parse
+
+    index_html = _INDEX_HTML.replace("__ROOT_PATH_JSON__", json.dumps(state.root_path))
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send_json(self, obj, status=200):
@@ -610,17 +705,24 @@ def _make_handler(state):
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            parts = [p for p in parsed.path.split("/") if p]
+            # Percent-decode every path segment (not just the queue name) --
+            # index arguments can now be 'rptr'/'wptr' expressions, and while
+            # the frontend already encodeURIComponent()s them, decoding here
+            # unconditionally keeps this endpoint correct for any client.
+            parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
 
             try:
                 if not parts:
-                    self._send_html(_INDEX_HTML)
+                    self._send_html(index_html)
                     return
                 if parts == ["api", "list"]:
                     self._send_json(state.listing())
                     return
+                if parts == ["api", "help"]:
+                    self._send_json({"lines": HELP_TEXT.splitlines()})
+                    return
                 if len(parts) >= 3 and parts[0] == "api" and parts[1] == "queue":
-                    name = urllib.parse.unquote(parts[2])
+                    name = parts[2]
                     try:
                         dump = state.get(name)
                     except KeyError:
@@ -628,13 +730,16 @@ def _make_handler(state):
                         return
 
                     action = parts[3] if len(parts) > 3 else "info"
+                    # packet/range/raw indices accept the same syntax as the
+                    # REPL: a plain int, or 'rptr'/'wptr' optionally followed
+                    # by +N/-N -- see _parse_index.
                     if action == "info":
                         self._send_json({"lines": capture(dump.print_info)})
                     elif action == "packet" and len(parts) == 5:
-                        n = int(parts[4])
+                        n = _parse_index(dump, parts[4])
                         self._send_json({"lines": capture(dump.print_packets, n, n + 1)})
                     elif action == "range" and len(parts) == 6:
-                        a, b = int(parts[4]), int(parts[5])
+                        a, b = _parse_index(dump, parts[4]), _parse_index(dump, parts[5])
                         self._send_json({"lines": capture(dump.print_packets, a, b + 1)})
                     elif action == "all":
                         count = dump.packet_count()
@@ -647,7 +752,7 @@ def _make_handler(state):
                             )
                         self._send_json({"lines": lines})
                     elif action == "raw" and len(parts) == 5:
-                        n = int(parts[4])
+                        n = _parse_index(dump, parts[4])
                         self._send_json({"lines": capture(dump.print_raw, n)})
                     elif action in ("rptr", "wptr"):
                         which = "read" if action == "rptr" else "write"
@@ -678,7 +783,7 @@ def run_web(path, host, port):
         print(f"No .bin files found under {path}", file=sys.stderr)
         return 1
 
-    state = _QueueWebState(files)
+    state = _QueueWebState(files, root_path=os.path.abspath(path))
     server = _ThreadingHTTPServer((host, port), _make_handler(state))
     print(f"Serving {len(files)} queue dump(s) from {path}")
     print(f"Open http://{host}:{port}/ in a browser (Ctrl-C to stop)")

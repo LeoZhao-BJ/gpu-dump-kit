@@ -340,11 +340,17 @@ Open http://127.0.0.1:8765/ in a browser (Ctrl-C to stop)
 Binds to `127.0.0.1` only by default (use an SSH tunnel/port-forward to reach it from your
 laptop, e.g. `ssh -L 8765:localhost:8765 <host>`) -- pass `--host 0.0.0.0` to listen on all
 interfaces if you really want that, and `--port N` to change the port. It's a plain-text
-browser version of the REPL (pick a queue in the sidebar, click info/all/rptr/wptr or type a
-packet/range/raw index) -- no ring visualization, stdlib `http.server` only, no extra
-dependencies to install. `all` is capped at 2000 packets in the browser view (says so in the
-output when it truncates) so a huge ring doesn't try to render a giant page in one go; use
-`range`/`packet` for anything beyond that.
+browser version of the REPL (pick a queue in the sidebar, click info/all/rptr/wptr, use the
+`help` button for the full command reference, or type a packet/range/raw index) -- no ring
+visualization, stdlib `http.server` only, no extra dependencies to install. `all` is capped at
+2000 packets in the browser view (says so in the output when it truncates) so a huge ring
+doesn't try to render a giant page in one go; use `range`/`packet` for anything beyond that.
+
+Full parity with the REPL: the `packet`/`range`/`raw` boxes accept `rptr`/`wptr` (optionally
+`+N`/`-N`) exactly like the REPL does, e.g. `wptr-1` or a range of `rptr` to `rptr+5`; an
+invalid index or unknown queue name returns a clean JSON error (400/404) instead of a
+traceback. The sidebar shows each queue's type (color-coded HSA/DMA/XGMI badge), qid, decoded
+packet count, and size so you can tell queues apart without opening each one.
 
 ## Manual, one queue at a time
 get queue info and dump queue packet and signal info manually, one at a time (in rocgdb):
