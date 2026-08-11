@@ -54,12 +54,86 @@ sudo rocgdb attach <pid>
       (`Id   Target Id ... Type ... Read   Write  Size     Address` header).
 - [ ] `info_dispatches.log` contains rocgdb's `info dispatches -full` output
       (or `No dispatches are currently active.` if none).
+- [ ] **When SDMA rptr/wptr enrichment succeeds** for a DMA/XGMI queue (see
+      section 3), its Read/Write values are patched directly into
+      `info_queues.log`'s existing columns, IN PLACE, in the same row and
+      table rocgdb itself printed (`_capture_and_patch_info_queues` ->
+      `_patch_info_queues_text`) -- NOT a separately appended section.
+      Values match `dump_summary.json`/the queue's own `.bin`/`.log`
+      metadata exactly (same raw, un-wrapped counter). HSA rows, and any
+      DMA/XGMI row enrichment didn't resolve, are byte-for-byte unchanged
+      from rocgdb's own output.
+- [ ] Column alignment survives real-world value widths: a small value
+      (e.g. `21`) lines up under the header the same way an HSA row's
+      Read/Write already do; a value as wide as (or wider than) its column
+      still renders with **at least one separating space** before the next
+      field -- regression test for a real bug caught in testing where a
+      7-digit enriched value glued directly onto the Size column with zero
+      separator, producing one unparseable merged number
+      (`20000008388608` instead of `2000000 8388608`).
+- [ ] Robust to wide Target Id rows (two-digit QIDs, where `parse_info_queue`'s
+      own docstring notes the column gap can collapse to a single space) --
+      patching still lands in the right place because each row's patch
+      position is derived from where that row's own Target Id actually
+      ended, not a fixed absolute column.
+- [ ] When enrichment finds nothing at all (no root, non-KFD host,
+      unrecognized generation, no matching queue), `info_queues.log` is
+      byte-for-byte just rocgdb's own `info queues` output.
 - [ ] Degrade path: run against a process with **no** GPU queues (e.g. a
       plain `sleep 60` attached via rocgdb) -- dump still completes, all
       four files are still written (summary shows zero queues), no crash.
 
 ```bash
 python3 -m json.tool rocgdb_dump_bin_pid*/dump_summary.json
+grep DMA rocgdb_dump_bin_pid*/info_queues.log   # Read/Write columns filled in if enrichment found something
+```
+
+```bash
+# unit test for _patch_info_queues_text: in-place patch, HSA rows untouched,
+# no-op when nothing to enrich, and the width-overflow separator-space fix
+python3 -c "
+import sys, types
+fake_gdb = types.ModuleType('gdb')
+class C:
+    def __init__(self, *a, **kw): pass
+fake_gdb.Command = C; fake_gdb.COMMAND_USER = 0
+fake_gdb.MemoryError = type('MemoryError', (Exception,), {})
+fake_gdb.error = type('error', (Exception,), {})
+fake_gdb.execute = lambda *a, **kw: ''
+fake_gdb.string_to_argv = lambda s: s.split()
+sys.modules['gdb'] = fake_gdb
+sys.path.insert(0, '.')
+import rocgdb_helper as rh
+
+text = '''  Id   Target Id                Type         Read   Write  Size     Address
+  1    AMDGPU Queue 8:1 (QID 5) DMA                        8388608  0x00007f49f2400000
+  3    AMDGPU Queue 8:3 (QID 3) HSA          2      2      1048576  0x00007f49f8c00000
+'''
+rows = rh.parse_info_queue(text)
+for r in rows:
+    if r['type'] == 'DMA':
+        r['read'], r['write'] = 21, 48
+patched = rh._patch_info_queues_text(text, rows)
+reparsed = rh.parse_info_queue(patched)
+by_tid = {r['target_id']: r for r in reparsed}
+assert by_tid['AMDGPU Queue 8:1 (QID 5)']['read'] == 21
+assert by_tid['AMDGPU Queue 8:1 (QID 5)']['write'] == 48
+for orig, new in zip(text.splitlines(), patched.splitlines()):
+    if 'HSA' in orig:
+        assert orig == new, 'HSA row must be untouched'
+# no-op case
+assert rh._patch_info_queues_text(text, []) == text
+
+# width-overflow case: a 7-digit write value must not glue onto Size
+rows2 = rh.parse_info_queue(text)
+for r in rows2:
+    if r['type'] == 'DMA':
+        r['read'], r['write'] = 21, 2000000
+patched2 = rh._patch_info_queues_text(text, rows2)
+line = [l for l in patched2.splitlines() if 'QID 5)' in l][0]
+assert '2000000' in line.split() and '8388608' in line.split(), line
+print('OK')
+"
 ```
 
 ---
@@ -199,7 +273,7 @@ Agent Dispatch, Invalid/Unknown -- same rendering core as SDMA
       everything that matters).
 - [ ] Replay against a real captured HSA `.bin` (16k+ packets) -- zero
       decode errors across the whole ring.
-- [ ] `rptr`/`wptr` jump navigation still works for HSA after all the
+- [ ] `rp`/`wp` jump navigation still works for HSA after all the
       renderer refactoring (`queue_viewer.py`'s `_print_hsa_range`/`packet_count`
       use direct O(1) addressing, unaffected by SDMA's block-splitting changes).
 
@@ -258,37 +332,44 @@ print('OK: all pipes aligned at column 35')
 
 ---
 
-## 7. `queue_viewer.py` REPL: history + wptr/rptr expressions
+## 7. `queue_viewer.py` REPL: history + rp/wp expressions
 
 **Feature:** up/down-arrow command history (via `readline`); `packet`/
-`range`/`raw` accept `rptr`/`wptr` (optionally `+N`/`-N`) as index arguments;
-`range` also has a one-letter alias `r` (matching `packet`'s `p`).
+`range`/`raw` accept `rp`/`wp` (optionally `+N`/`-N`) as index arguments;
+`range` also has a one-letter alias `r` (matching `packet`'s `p`). The
+commands were originally named `rptr`/`wptr` and were shortened to `rp`/`wp`
+for convenience -- `rptr`/`wptr` are no longer recognized as commands (the
+underlying hardware concept/feature name "SDMA rptr/wptr enrichment" in
+`rocgdb_helper.py`/README is unrelated and unaffected by this rename).
 
 - [ ] `import readline` succeeds without error on this host (or degrades
       silently via `except ImportError: pass` where unavailable).
-- [ ] `packet wptr` == `packet <resolved wptr index>` (same output).
-- [ ] `range rptr rptr+1` decodes exactly 2 packets (rptr's index and the
-      next one); `r rptr rptr+1` produces identical output.
-- [ ] `raw wptr-1` hex-dumps the packet immediately before the write pointer.
+- [ ] `packet wp` == `packet <resolved wp index>` (same output).
+- [ ] `range rp rp+1` decodes exactly 2 packets (rp's index and the
+      next one); `r rp rp+1` produces identical output.
+- [ ] `raw wp-1` hex-dumps the packet immediately before the write pointer.
 - [ ] Invalid token (e.g. `packet notaptr`) still produces a clean
       `error: invalid literal for int() with base 0: 'notaptr'` -- no traceback.
-- [ ] **`rptr`/`wptr` alone (bare commands) must not crash when the pointer
+- [ ] **`rp`/`wp` alone (bare commands) must not crash when the pointer
       actually resolves to a real index** -- regression test for a real bug:
       `_resolve_pointer`'s HSA success path once returned a dict with no
       `"reason"` key, and `jump_to_pointer`'s `info["reason"]` lookup raised
-      `KeyError: 'reason'` on *every successful* `wptr`/`rptr` (only the
+      `KeyError: 'reason'` on *every successful* `wp`/`rp` (only the
       already-handled "missing"/"empty" paths worked) -- fixed by adding
       `"reason": None` to that return and switching all reads to
-      `info.get("reason")`. Confirm bare `wptr`/`rptr` print the full
+      `info.get("reason")`. Confirm bare `wp`/`rp` print the full
       diagnostic message and the packet, with no traceback: `raw=N -> dword
       slot M -> byte offset 0x... -> packet index K (of TOTAL)` for SDMA,
       `raw=N -> slot index K (of TOTAL)` for HSA.
 - [ ] These expressions work for **both** HSA and DMA/XGMI dumps.
+- [ ] The old `rptr`/`wptr` spellings are gone: typing `wptr` produces
+      `unknown command: 'wptr' (try 'help')`, not a silent alias.
 
 ```bash
-printf 'wptr\nrptr\npacket wptr\nrange rptr rptr+1\nr rptr rptr+1\nraw wptr-1\npacket notaptr\nquit\n' \
+printf 'wp\nrp\npacket wp\nrange rp rp+1\nr rp rp+1\nraw wp-1\npacket notaptr\nwptr\nquit\n' \
   | python3 queue_viewer.py <any>.bin
-# expect: no "KeyError" / "Traceback" anywhere in the output
+# expect: no "KeyError" / "Traceback" anywhere in the output, and
+# "unknown command: 'wptr'" for the old spelling
 ```
 
 ---
@@ -303,7 +384,7 @@ wrapping to a ring-relative position happens at use time in
 - [ ] `dump_summary.json`/`.bin` metadata `read`/`write` for a DMA/XGMI
       queue can legitimately be **larger** than `size/4` (ring capacity in
       dwords) if the ring has wrapped -- this is correct, not a bug.
-- [ ] `queue_viewer.py`'s `wptr`/`rptr` message shows the full conversion
+- [ ] `queue_viewer.py`'s `wp`/`rp` message shows the full conversion
       chain: `raw=N -> dword slot M -> byte offset 0x... -> packet index K
       (of TOTAL)` -- `dword slot M` must equal `N % (ring_size_bytes // 4)`.
 - [ ] A synthetic raw value several multiples of the ring capacity still
@@ -318,7 +399,71 @@ wrapping to a ring-relative position happens at use time in
 
 ---
 
-## 9. `queue_viewer.py --web` browser UI (parity with the REPL)
+## 9. `queue_viewer.py` REPL directory browsing (`list`/`use`)
+
+**Feature:** pointing the REPL (non-`--web`) at a directory instead of a
+single `.bin` file gains `list`/`ls`/`queues` (show every dump found) and
+`use <index_or_name>` (switch which queue the rest of the commands apply
+to), mirroring `--web`'s sidebar without needing a browser
+(`run_repl_dir`/`_dispatch_command`/`_peek_dump_metadata`).
+
+- [ ] `python3 queue_viewer.py <dir>` (no `--web`) prints
+      `N queue dump(s) found under <dir>` followed by one `[i] name  type=...
+      size=... rp=... wp=...` line per `.bin` file, then a REPL prompt --
+      no traceback, no full-ring decode yet (see next bullet). `qid`/
+      `target_id` are deliberately NOT shown -- they're already encoded in
+      the filename itself (`dma_QID11_GPU_7_Queue_22.bin`); `rp`/`wp` are
+      shown instead since those aren't derivable from the filename.
+- [ ] `list` is fast even for many/large queues: it only reads each dump's
+      header (`_peek_dump_metadata`), never the ring bytes -- a queue's
+      packets are only decoded once it's actually selected via `use`.
+- [ ] `use N` (0-based index into the listing) and `use <exact filename>`
+      both select that queue; `use <name>` also accepts an **unambiguous
+      filename prefix** (e.g. `use dma_QID4` when the full name is
+      `dma_QID4_GPU_8_Queue_2.bin`) -- if the prefix matches more than one
+      file, a clear "matches N queues, be more specific: ..." error lists
+      the candidates instead of guessing.
+- [ ] After `use`, the prompt changes to `(queue_viewer:<name>) >`, and the
+      selected queue's packet count is printed (same startup message
+      `run_repl` prints for a single-file invocation).
+- [ ] `use nope` (no match) prints `no such queue: 'nope' (try 'list')` --
+      no traceback, selection (if any) unchanged.
+- [ ] Once a queue is selected, every single-file command works exactly as
+      it does for `python3 queue_viewer.py <that_file>.bin` directly --
+      `info`/`packet`/`range`/`all`/`raw`/`rp`/`wp`, including `rp`/
+      `wp` expressions (`packet wp-1`, etc.) -- same output either way.
+- [ ] Running any of those commands **before** the first `use` prints
+      `no queue selected -- try 'list' then 'use <index_or_name>'` instead
+      of crashing.
+- [ ] `list` while a queue is selected marks it with `*` in the listing.
+- [ ] `help` shows both the directory commands (`list`/`use`) and the full
+      single-file `HELP_TEXT`.
+- [ ] Switching `use` between an HSA and a DMA/XGMI queue in the same
+      session works correctly for both (packet counts, rp/wp, decode
+      format all correct for whichever is currently selected).
+- [ ] Empty directory (no `.bin` files): prints `No .bin files found under
+      <dir>` to stderr and exits 1 -- no traceback.
+- [ ] A single `.bin` **file** passed directly (not a directory) is
+      completely unaffected by this feature -- still goes straight into
+      `run_repl` with its original `Loaded ... / N packet(s) .../ Type
+      'help'...` startup messages, no `list`/`use` step.
+
+```bash
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+DUMP_DIR=$(ls -d rocgdb_dump_bin_pid*/ | head -1)
+printf 'list\nuse 0\ninfo\nuse hsa_QID\nuse nope\nlist\nquit\n' | python3 queue_viewer.py "$DUMP_DIR"
+# expect: listing, then an ambiguous-prefix error for 'hsa_QID' (multiple
+# HSA queues), then 'no such queue' for 'nope', then a listing with '*' on
+# whichever queue 'use 0' selected -- no traceback anywhere
+
+mkdir -p /tmp/qv_empty_test && python3 queue_viewer.py /tmp/qv_empty_test; echo "exit=$?"
+# expect: "No .bin files found under /tmp/qv_empty_test", exit=1
+rmdir /tmp/qv_empty_test
+```
+
+---
+
+## 10. `queue_viewer.py --web` browser UI (parity with the REPL)
 
 **Feature:** the browser UI is a thin HTTP wrapper around the exact same
 `QueueDump` methods the REPL calls -- every endpoint below must produce
@@ -339,12 +484,13 @@ output identical (line-for-line) to the equivalent REPL command, not just
       hand-duplicated copy in the JS.
 - [ ] `GET /api/queue/<name>/info` output == REPL `info` output for the same file.
 - [ ] `GET /api/queue/<name>/packet/<n>`, `.../range/<a>/<b>`, `.../raw/<n>`,
-      `.../rptr`, `.../wptr` all match the REPL's `packet`/`range`/`raw`/
-      `rptr`/`wptr` output for the same arguments.
+      `.../rp`, `.../wp` all match the REPL's `packet`/`range`/`raw`/
+      `rp`/`wp` output for the same arguments. The old `.../rptr`/`.../wptr`
+      paths are gone -- 404, not an alias.
 - [ ] **Parity gap this section exists to close:** `packet`/`range`/`raw`
-      accept `rptr`/`wptr` (optionally `+N`/`-N`) exactly like the REPL --
-      e.g. `.../packet/wptr-1`, `.../range/rptr/rptr%2B2` (the `%2B` is
-      what `encodeURIComponent('rptr+2')` produces; the server
+      accept `rp`/`wp` (optionally `+N`/`-N`) exactly like the REPL --
+      e.g. `.../packet/wp-1`, `.../range/rp/rp%2B2` (the `%2B` is
+      what `encodeURIComponent('rp+2')` produces; the server
       percent-decodes every path segment, not just the queue name, then
       parses it the same way `_parse_index` does for the REPL).
 - [ ] `GET /api/queue/<name>/packet/notaptr` -> HTTP 400, JSON `{"error": "..."}`
@@ -365,10 +511,70 @@ SERVER_PID=$!
 sleep 1
 NAME=$(python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8799/api/list'))[0]['name'])")
 curl -s http://127.0.0.1:8799/ | grep -q '__ROOT_PATH_JSON__' && echo "FAIL: marker not substituted" || echo "OK: marker substituted"
-curl -s "http://127.0.0.1:8799/api/queue/$NAME/packet/wptr-1" | python3 -m json.tool | head -5
+curl -s "http://127.0.0.1:8799/api/queue/$NAME/packet/wp-1" | python3 -m json.tool | head -5
 curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/queue/$NAME/packet/notaptr"   # expect 400
 curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/queue/nope.bin/info"           # expect 404
+curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/queue/$NAME/wptr"              # expect 404 (old spelling gone)
 kill $SERVER_PID
+```
+
+---
+
+## 11. `dump_all_queues.sh` one-shot wrapper script
+
+**Feature:** automates `attach <pid>` / `source rocgdb_helper.py` /
+`dump_all_queues` / `detach` / `quit` into a single command, pid supplied
+as a CLI argument (not hand-edited into a file like `save_info.gdb`).
+
+- [ ] `bash -n dump_all_queues.sh` passes (syntax only, no execution).
+- [ ] No args, or more than 2 positional args -> prints usage to stderr,
+      exits 1, no rocgdb invocation attempted.
+- [ ] Non-numeric pid (e.g. `abc`) -> `error: 'abc' is not a valid pid
+      (expected a number)`, exits 1, no rocgdb invocation attempted.
+- [ ] Nonexistent pid (e.g. a huge number unlikely to be a real pid) ->
+      `error: no process with pid N (checked /proc/N)`, exits 1, no rocgdb
+      invocation attempted.
+- [ ] `--help`/`-h` prints usage and exits 1 without attempting anything.
+- [ ] Unknown option (e.g. `--bogus`) -> `error: unknown option '--bogus'`
+      + usage, exits 1.
+- [ ] Real end-to-end run against a live process: attaches, sources
+      `rocgdb_helper.py` (absolute path, resolved from the script's own
+      directory -- works regardless of the caller's cwd), runs
+      `dump_all_queues`, detaches cleanly (`[Inferior N (process PID)
+      detached]` in the output, not a hang or a crash), and exits 0.
+- [ ] The named `[output_dir]` (when given) is what `dump_all_queues`
+      actually writes to -- same four files (`dump_summary.json`,
+      `info_queues.log`, `info_dispatches.log`, `backtrace_all_threads.log`)
+      as running the command manually inside `rocgdb`.
+- [ ] Full rocgdb session transcript is saved to
+      `dump_all_queues_pid<pid>_<timestamp>.log` in the current directory
+      (not the output dir), and matches what was printed to the terminal.
+- [ ] `--txt <pid>` runs `dump_all_queues_txt` instead (visible in the
+      transcript as `dump_all_queues_txt complete: ...`, and in
+      `dump_summary.json`'s `"command"` field).
+- [ ] Missing `rocgdb_helper.py` (e.g. run from a copy of just this one
+      script) -> clear `error: rocgdb_helper.py not found at ...`, exits 1,
+      no rocgdb invocation attempted.
+- [ ] Already running as root -> does NOT prefix `sudo` (`sudo` would
+      otherwise prompt for a password unnecessarily / fail in a
+      passwordless-sudo-less root shell).
+
+```bash
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+bash -n dump_all_queues.sh && echo SYNTAX_OK
+./dump_all_queues.sh; echo "exit=$?"                 # expect usage + exit 1
+./dump_all_queues.sh abc; echo "exit=$?"              # expect invalid-pid error
+./dump_all_queues.sh 999999999; echo "exit=$?"        # expect no-such-process error
+
+# real end-to-end run (needs root/sudo, and something to attach to --
+# a plain long-running process works fine to exercise attach/dump/detach,
+# though it won't have GPU queues to actually decode):
+tail -f /dev/null &
+TEST_PID=$!
+./dump_all_queues.sh "$TEST_PID" /tmp/dump_script_test
+kill "$TEST_PID"
+python3 -m json.tool /tmp/dump_script_test/dump_summary.json
+sudo rm -rf /tmp/dump_script_test dump_all_queues_pid*.log   # cleanup (root-owned)
 ```
 
 ---

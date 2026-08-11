@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Standalone offline viewer for the .bin queue dumps produced by
-rocgdb_helper.py's `dump_all_queues_bin` rocgdb command.
+rocgdb_helper.py's `dump_all_queues` rocgdb command.
 
 No gdb dependency at all -- this reads the raw ring bytes straight out of
 the dump file and decodes packets against an in-memory buffer, using the
@@ -8,24 +8,32 @@ exact same packet-format logic as the live path (see queue_decode.py).
 
 Usage:
     python3 queue_viewer.py <dump.bin>              # interactive REPL, one file
+    python3 queue_viewer.py <dir_of_dumps>           # REPL with 'list'/'use' to switch queues
     python3 queue_viewer.py <dir_or_file> --web      # browser UI (localhost only by default)
 
 REPL prompt commands (up/down-arrow command history via readline, when
 available):
-    info                 show the queue's metadata (qid/type/addr/rptr/wptr/size/...)
+    info                 show the queue's metadata (qid/type/addr/rp/wp/size/...)
     packet N  (p N)       decode and show packet index N
     range A B  (r A B)    decode and show packets A..B (inclusive)
     all                   decode the whole ring
     raw N                 hex-dump the raw bytes for packet/slot N
-    rptr / wptr           jump to the packet at the read/write pointer
+    rp / wp               jump to the packet at the read/write pointer
                           (HSA: always available; DMA/XGMI: only if the dump
                           carries SDMA rptr/wptr enrichment -- see README)
     help                  show this list
     quit / exit           leave
 
-N/A/B above accept a plain integer, or 'rptr'/'wptr' optionally followed by
-+N/-N (e.g. "range rptr rptr+5", "raw wptr-1"), resolved the same way the
-rptr/wptr commands themselves resolve.
+When pointed at a directory instead of a single file, two more commands
+are available (see run_repl_dir) to switch which queue the above commands
+apply to, without restarting the tool:
+    list / ls / queues    show every .bin dump found in the directory
+    use N_or_name          switch to that queue (0-based index, exact
+                          filename, or an unambiguous filename prefix)
+
+N/A/B above accept a plain integer, or 'rp'/'wp' optionally followed by
++N/-N (e.g. "range rp rp+5", "raw wp-1"), resolved the same way the
+rp/wp commands themselves resolve.
 """
 
 import json
@@ -210,12 +218,12 @@ class QueueDump:
             hexpart = " ".join(f"{b:02x}" for b in chunk)
             emit(f"  0x{addr + off:x}: {hexpart}")
 
-    # -- jump straight to the rptr/wptr slot ---------------------------
+    # -- jump straight to the rp/wp slot ---------------------------
     def _resolve_pointer(self, which):
-        """Resolve rptr ('read')/wptr ('write') to a packet index, quietly
+        """Resolve rp ('read')/wp ('write') to a packet index, quietly
         (no printing) -- shared by jump_to_pointer (which prints a
         diagnostic message built from this) and resolve_pointer_index
-        (which just wants the index, e.g. for the REPL's 'wptr'/'rptr'
+        (which just wants the index, e.g. for the REPL's 'wp'/'rp'
         expression support). Returns a dict; 'idx' is None when
         unavailable/unresolvable, always with enough info in the dict to
         explain why.
@@ -271,15 +279,15 @@ class QueueDump:
 
     def resolve_pointer_index(self, which):
         """Quiet version of jump_to_pointer's resolution: returns the
-        packet index (int) rptr/wptr currently points to, or None if it
+        packet index (int) rp/wp currently points to, or None if it
         isn't available/resolvable for this dump. Used by the REPL to
-        support 'wptr'/'rptr' (optionally with a +N/-N offset) as
+        support 'wp'/'rp' (optionally with a +N/-N offset) as
         packet-index arguments to packet/range/raw."""
         return self._resolve_pointer(which)["idx"]
 
     def jump_to_pointer(self, which, emit=print):
-        """which: 'read' (rptr) or 'write' (wptr)."""
-        label = "rptr" if which == "read" else "wptr"
+        """which: 'read' (rp) or 'write' (wp)."""
+        label = "rp" if which == "read" else "wp"
         info = self._resolve_pointer(which)
 
         if info.get("reason") == "missing":
@@ -292,7 +300,7 @@ class QueueDump:
                 # needs root) found and recorded a value -- see README.
                 emit(
                     f"no {label} recorded in this dump's metadata -- {self.qtype} "
-                    f"rptr/wptr requires the dump-time SDMA enrichment step "
+                    f"rp/wp requires the dump-time SDMA enrichment step "
                     f"(root access to KFD debugfs) to have found this queue"
                 )
             return
@@ -319,47 +327,87 @@ class QueueDump:
 
 HELP_TEXT = """\
 Commands:
-  info                 show queue metadata (qid/type/addr/rptr/wptr/size/...)
+  info                 show queue metadata (qid/type/addr/rp/wp/size/...)
   packet N   (p N)     decode and show packet index N
   range A B  (r A B)   decode and show packets A..B (inclusive)
   all                  decode the whole ring
   raw N                hex-dump the raw bytes for packet/slot N
-  rptr                 jump to and decode the packet at the read pointer
+  rp                   jump to and decode the packet at the read pointer
                        (HSA: always available; DMA/XGMI: only if the dump
                        carries SDMA rptr/wptr enrichment -- see README)
-  wptr                 jump to and decode the packet at the write pointer
-                       (same availability note as rptr)
+  wp                   jump to and decode the packet at the write pointer
+                       (same availability note as rp)
   help                 show this list
   quit / exit          leave
 
-N/A/B above accept a plain integer (decimal or 0x-prefixed hex), or 'rptr'/
-'wptr' optionally followed by +N/-N, resolved the same way the rptr/wptr
+N/A/B above accept a plain integer (decimal or 0x-prefixed hex), or 'rp'/
+'wp' optionally followed by +N/-N, resolved the same way the rp/wp
 commands do, e.g.:
-  packet wptr          decode the packet currently at the write pointer
-  range rptr rptr+5     decode from the read pointer through 5 packets later
-  raw wptr-1            hex-dump the packet just before the write pointer
+  packet wp             decode the packet currently at the write pointer
+  range rp rp+5          decode from the read pointer through 5 packets later
+  raw wp-1               hex-dump the packet just before the write pointer
 """
 
-_PTR_EXPR_RE = re.compile(r"^(rptr|wptr)\s*([+-]\s*\d+)?$", re.IGNORECASE)
+_PTR_EXPR_RE = re.compile(r"^(rp|wp)\s*([+-]\s*\d+)?$", re.IGNORECASE)
 
 
 def _parse_index(dump, token):
     """Parse a packet-index argument for the REPL: a plain integer (any
-    base int() accepts, e.g. '0x10'), or 'rptr'/'wptr' optionally followed
-    by a +N/-N offset (e.g. 'wptr+1', 'rptr-2'), resolved via the same
-    logic the rptr/wptr commands use (QueueDump.resolve_pointer_index).
+    base int() accepts, e.g. '0x10'), or 'rp'/'wp' optionally followed
+    by a +N/-N offset (e.g. 'wp+1', 'rp-2'), resolved via the same
+    logic the rp/wp commands use (QueueDump.resolve_pointer_index).
     Raises ValueError with a clear message on failure -- callers already
     catch ValueError from the plain int() case, so this fits the same
     error-handling path without any extra code at the call sites."""
     m = _PTR_EXPR_RE.match(token)
     if not m:
         return int(token, 0)
-    which = "read" if m.group(1).lower() == "rptr" else "write"
+    which = "read" if m.group(1).lower() == "rp" else "write"
     idx = dump.resolve_pointer_index(which)
     if idx is None:
         raise ValueError(f"{m.group(1)} is not available for this dump")
     offset_str = (m.group(2) or "").replace(" ", "")
     return idx + (int(offset_str) if offset_str else 0)
+
+
+def _dispatch_command(dump, cmd, parts):
+    """Execute one REPL command against `dump`. Returns True to keep the
+    REPL loop running, False if this was a quit/exit command. Raises
+    ValueError/IndexError on bad input -- callers already catch those and
+    print 'error: ...' the same way, for both the single-file REPL
+    (run_repl) and the multi-queue directory REPL (run_repl_dir)."""
+    if cmd in ("quit", "exit", "q"):
+        return False
+    elif cmd == "help":
+        print(HELP_TEXT)
+    elif cmd == "info":
+        dump.print_info()
+    elif cmd in ("packet", "p"):
+        if len(parts) != 2:
+            print("usage: packet N (N: int, or rp/wp +/-N)")
+            return True
+        n = _parse_index(dump, parts[1])
+        dump.print_packets(n, n + 1)
+    elif cmd in ("range", "r"):
+        if len(parts) != 3:
+            print("usage: range A B (A/B: int, or rp/wp +/-N)")
+            return True
+        a, b = _parse_index(dump, parts[1]), _parse_index(dump, parts[2])
+        dump.print_packets(a, b + 1)
+    elif cmd == "all":
+        dump.print_packets(0, dump.packet_count())
+    elif cmd == "raw":
+        if len(parts) != 2:
+            print("usage: raw N (N: int, or rp/wp +/-N)")
+            return True
+        dump.print_raw(_parse_index(dump, parts[1]))
+    elif cmd == "rp":
+        dump.jump_to_pointer("read")
+    elif cmd == "wp":
+        dump.jump_to_pointer("write")
+    else:
+        print(f"unknown command: {cmd!r} (try 'help')")
+    return True
 
 
 def run_repl(dump):
@@ -383,37 +431,8 @@ def run_repl(dump):
         cmd = parts[0].lower()
 
         try:
-            if cmd in ("quit", "exit", "q"):
+            if not _dispatch_command(dump, cmd, parts):
                 break
-            elif cmd == "help":
-                print(HELP_TEXT)
-            elif cmd == "info":
-                dump.print_info()
-            elif cmd in ("packet", "p"):
-                if len(parts) != 2:
-                    print("usage: packet N (N: int, or rptr/wptr +/-N)")
-                    continue
-                n = _parse_index(dump, parts[1])
-                dump.print_packets(n, n + 1)
-            elif cmd in ("range", "r"):
-                if len(parts) != 3:
-                    print("usage: range A B (A/B: int, or rptr/wptr +/-N)")
-                    continue
-                a, b = _parse_index(dump, parts[1]), _parse_index(dump, parts[2])
-                dump.print_packets(a, b + 1)
-            elif cmd == "all":
-                dump.print_packets(0, dump.packet_count())
-            elif cmd == "raw":
-                if len(parts) != 2:
-                    print("usage: raw N (N: int, or rptr/wptr +/-N)")
-                    continue
-                dump.print_raw(_parse_index(dump, parts[1]))
-            elif cmd == "rptr":
-                dump.jump_to_pointer("read")
-            elif cmd == "wptr":
-                dump.jump_to_pointer("write")
-            else:
-                print(f"unknown command: {cmd!r} (try 'help')")
         except (ValueError, IndexError) as e:
             print(f"error: {e}")
 
@@ -422,11 +441,135 @@ def list_bin_files(path):
     """Return sorted [(name, full_path), ...] of .bin dumps under path.
     If path is itself a .bin file (not a directory), returns just that one
     entry -- lets `--web` work the same way against a single file or a
-    whole dump_all_queues_bin output directory."""
+    whole dump_all_queues output directory."""
     if os.path.isdir(path):
         names = sorted(f for f in os.listdir(path) if f.endswith(".bin"))
         return [(n, os.path.join(path, n)) for n in names]
     return [(os.path.basename(path), path)]
+
+
+def _peek_dump_metadata(path):
+    """Read just a .bin dump's header (qid/type/size/target_id/...) without
+    loading the rest of the file -- DMA/XGMI rings are commonly several MB,
+    so this keeps `run_repl_dir`'s 'list' command fast and light regardless
+    of how many/how large the queues in a directory are. Full ring bytes
+    are only loaded once a queue is actually selected via 'use'."""
+    with open(path, "rb") as f:
+        return qd.read_dump_header(f)
+
+
+def run_repl_dir(path):
+    """Directory version of the REPL: list every .bin dump under `path` and
+    let the user switch between them at any time with 'use', instead of
+    fixing the REPL to a single file for the whole session (run_repl). Each
+    dump is loaded lazily -- only once actually selected -- and cached for
+    the rest of the session, mirroring `--web`'s per-queue lazy loading."""
+    files = list_bin_files(path)
+    if not files:
+        print(f"No .bin files found under {path}", file=sys.stderr)
+        return 1
+
+    names = [n for n, _ in files]
+    paths_by_name = dict(files)
+    dumps = {}  # name -> loaded QueueDump, filled in on first 'use'
+    current = [None]  # mutable cell so the nested closures below see updates
+
+    def get(name):
+        if name not in dumps:
+            dumps[name] = QueueDump(paths_by_name[name])
+        return dumps[name]
+
+    def resolve_name(token):
+        """'use'/list-selector argument -> exact name, or None if it
+        doesn't match anything. Accepts a 0-based index into the sorted
+        listing, an exact filename, or an unambiguous filename prefix."""
+        if token in paths_by_name:
+            return token
+        if token.isdigit() and 0 <= int(token) < len(names):
+            return names[int(token)]
+        matches = [n for n in names if n.startswith(token)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                f"{token!r} matches {len(matches)} queues, be more specific: "
+                + ", ".join(matches)
+            )
+        return None
+
+    def print_list():
+        for i, name in enumerate(names):
+            marker = "*" if name == current[0] else " "
+            try:
+                m = _peek_dump_metadata(paths_by_name[name])
+                # qid/target_id are already encoded in the filename itself
+                # (e.g. dma_QID11_GPU_7_Queue_22.bin) -- no need to repeat
+                # them here. rp/wp (raw, un-wrapped -- same convention as
+                # 'info') are the useful at-a-glance values instead, since
+                # they're not derivable from the filename.
+                detail = (
+                    f"type={m.get('type')} size={m.get('size')} "
+                    f"rp={m.get('read')} wp={m.get('write')}"
+                )
+            except Exception as e:
+                detail = f"error: {e}"
+            print(f" {marker} [{i}] {name}  {detail}")
+
+    print(f"{len(names)} queue dump(s) found under {path}")
+    print_list()
+    print("Type 'use <index_or_name>' to select one, 'list' to see this again, 'help' for commands.")
+
+    while True:
+        prompt = f"(queue_viewer:{current[0]}) > " if current[0] else "(queue_viewer) > "
+        try:
+            line = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        parts = line.split()
+        cmd = parts[0].lower()
+
+        try:
+            if cmd in ("quit", "exit", "q"):
+                break
+            elif cmd in ("list", "ls", "queues"):
+                print_list()
+            elif cmd == "use":
+                if len(parts) != 2:
+                    print("usage: use <index_or_name>")
+                    continue
+                name = resolve_name(parts[1])
+                if name is None:
+                    print(f"no such queue: {parts[1]!r} (try 'list')")
+                    continue
+                try:
+                    dump = get(name)  # trigger load now, surfacing any error here
+                except (OSError, ValueError) as e:
+                    print(f"Cannot open {name}: {e}")
+                    continue
+                current[0] = name
+                print(f"switched to {name} ({dump.qtype}, qid={dump.metadata.get('qid')})")
+                try:
+                    count = dump.packet_count()
+                    print(f"{count} packet(s) decoded/available (indices 0..{max(count - 1, 0)})")
+                except Exception as e:
+                    print(f"warning: could not pre-scan packets: {e}")
+            elif cmd == "help":
+                print("Directory commands:")
+                print("  list / ls / queues     show queue dumps found under this directory")
+                print("  use <index_or_name>    switch to that queue (accepts a name prefix too)")
+                print()
+                print(HELP_TEXT)
+            elif current[0] is None:
+                print("no queue selected -- try 'list' then 'use <index_or_name>'")
+            else:
+                if not _dispatch_command(get(current[0]), cmd, parts):
+                    break
+        except (ValueError, IndexError) as e:
+            print(f"error: {e}")
+    return 0
 
 
 def capture(bound_method, *args, **kwargs):
@@ -521,29 +664,29 @@ _INDEX_HTML = """<!doctype html>
       <div class="row">
         <button onclick="doInfo()">info</button>
         <button onclick="doAll()">all</button>
-        <button class="primary" onclick="doRptr()">rptr</button>
-        <button class="primary" onclick="doWptr()">wptr</button>
+        <button class="primary" onclick="doRp()">rp</button>
+        <button class="primary" onclick="doWp()">wp</button>
       </div>
       <div class="row">
         <label>packet</label>
-        <input type="text" id="pkt" placeholder="N or wptr-1" onkeydown="if(event.key==='Enter')doPacket()">
+        <input type="text" id="pkt" placeholder="N or wp-1" onkeydown="if(event.key==='Enter')doPacket()">
         <button onclick="doPacket()">go</button>
       </div>
       <div class="row">
         <label>range</label>
-        <input type="text" id="rangeA" placeholder="rptr" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
-        <input type="text" id="rangeB" placeholder="wptr+5" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
+        <input type="text" id="rangeA" placeholder="rp" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
+        <input type="text" id="rangeB" placeholder="wp+5" style="width:90px" onkeydown="if(event.key==='Enter')doRange()">
         <button onclick="doRange()">go</button>
       </div>
       <div class="row">
         <label>raw</label>
-        <input type="text" id="rawn" placeholder="N or rptr" onkeydown="if(event.key==='Enter')doRaw()">
+        <input type="text" id="rawn" placeholder="N or rp" onkeydown="if(event.key==='Enter')doRaw()">
         <button onclick="doRaw()">go</button>
       </div>
     </div>
     <div id="output" class="empty">Pick a queue on the left, then use the buttons above (or 'help' for the
-full command reference -- N/A/B accept a plain integer or rptr/wptr optionally followed by +N/-N,
-e.g. "wptr-1" or "range rptr rptr+5").</div>
+full command reference -- N/A/B accept a plain integer or rp/wp optionally followed by +N/-N,
+e.g. "wp-1" or "range rp rp+5").</div>
   </div>
 </div>
 <script>
@@ -611,8 +754,8 @@ function q(path) { return '/api/queue/' + encodeURIComponent(current) + path; }
 function doHelp()  { api('/api/help').then(show); }
 function doInfo()  { if (need()) api(q('/info')).then(show); }
 function doAll()   { if (need()) api(q('/all')).then(show); }
-function doRptr()  { if (need()) api(q('/rptr')).then(show); }
-function doWptr()  { if (need()) api(q('/wptr')).then(show); }
+function doRp()  { if (need()) api(q('/rp')).then(show); }
+function doWp()  { if (need()) api(q('/wp')).then(show); }
 function doPacket() {
   if (!need()) return;
   const n = document.getElementById('pkt').value.trim();
@@ -706,7 +849,7 @@ def _make_handler(state):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             # Percent-decode every path segment (not just the queue name) --
-            # index arguments can now be 'rptr'/'wptr' expressions, and while
+            # index arguments can now be 'rp'/'wp' expressions, and while
             # the frontend already encodeURIComponent()s them, decoding here
             # unconditionally keeps this endpoint correct for any client.
             parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
@@ -731,7 +874,7 @@ def _make_handler(state):
 
                     action = parts[3] if len(parts) > 3 else "info"
                     # packet/range/raw indices accept the same syntax as the
-                    # REPL: a plain int, or 'rptr'/'wptr' optionally followed
+                    # REPL: a plain int, or 'rp'/'wp' optionally followed
                     # by +N/-N -- see _parse_index.
                     if action == "info":
                         self._send_json({"lines": capture(dump.print_info)})
@@ -754,8 +897,8 @@ def _make_handler(state):
                     elif action == "raw" and len(parts) == 5:
                         n = _parse_index(dump, parts[4])
                         self._send_json({"lines": capture(dump.print_raw, n)})
-                    elif action in ("rptr", "wptr"):
-                        which = "read" if action == "rptr" else "write"
+                    elif action in ("rp", "wp"):
+                        which = "read" if action == "rp" else "write"
                         self._send_json({"lines": capture(dump.jump_to_pointer, which)})
                     else:
                         self._send_json({"error": f"unknown action {action!r}"}, status=404)
@@ -798,7 +941,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", help="a .bin dump file, or a directory of them (for --web)")
+    parser.add_argument("path", help="a .bin dump file, or a directory of them")
     parser.add_argument("--web", action="store_true", help="serve a browser UI instead of the REPL")
     parser.add_argument("--host", default="127.0.0.1", help="--web bind address (default: 127.0.0.1, localhost only)")
     parser.add_argument("--port", type=int, default=8765, help="--web bind port (default: 8765)")
@@ -806,6 +949,9 @@ def main():
 
     if args.web:
         return run_web(args.path, args.host, args.port)
+
+    if os.path.isdir(args.path):
+        return run_repl_dir(args.path)
 
     try:
         dump = QueueDump(args.path)

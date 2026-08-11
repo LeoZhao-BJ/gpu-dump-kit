@@ -22,14 +22,14 @@ Leo Zhao (2026-08):
 - `dump_all_queues` / `dump_all_queues_txt` commands in `rocgdb_helper.py` -- automatically find
   and dump every HSA/DMA/XGMI queue (plus all-thread backtraces) instead of hand-copying
   addresses out of `info queue` one at a time.
-- `rptr`/`wptr` jump navigation, XGMI queue-type support, and a handful of bug fixes found along
+- `rp`/`wp` jump navigation, XGMI queue-type support, and a handful of bug fixes found along
   the way (a `super()` typo in `ModifyHsaSignal` that crashed the whole script load, an
   `info queue` column-parsing regex that misread Type as a Read value on two-digit queue IDs,
   a packet index counter that never incremented in the SDMA decoder).
 - Per-run `dump_summary.json`, `info queues`/`info dispatches` capture, and Target Id embedded in
   queue dump filenames (see "Auto-dump everything" below).
 - Best-effort SDMA rptr/wptr enrichment for DMA/XGMI queues, read straight out of KFD debugfs
-  (no `umr` dependency), plus `rptr`/`wptr` jump navigation for DMA/XGMI in `queue_viewer.py`
+  (no `umr` dependency), plus `rp`/`wp` jump navigation for DMA/XGMI in `queue_viewer.py`
   (see "SDMA rptr/wptr enrichment" below).
 - Full SDMA packet decode, ported from UMR's own SDMA source
   (`umr/src/lib/packet/sdma/read_sdma_stream.c` + `sdma_decode_opcodes.c`) -- replacing an
@@ -47,6 +47,9 @@ Leo Zhao (2026-08):
 - `queue_viewer.py` -- standalone offline tool for browsing `.bin` dumps (REPL or `--web`).
 - `save_info.gdb` -- one-shot script for the older `sudo rocgdb -x save_info.gdb` workflow
   (attach, dump queues/dispatches/threads/registers, quit).
+- `dump_all_queues.sh` -- one-shot wrapper: attach to a given pid, source `rocgdb_helper.py`,
+  run `dump_all_queues`, detach -- no manual `attach`/`source`/`quit` typing, no editing a
+  hardcoded pid into a file (see "One-shot script" below).
 
 ## Use rocgdb to save info
 modify the `<hang_pid>` in `save_info.gdb` and run command:
@@ -60,6 +63,29 @@ rocgdb attach the <hang_pid> and enable script:
 sudo rocgdb attach <hang_pid>
 source rocgdb_helper.py
 ```
+
+## One-shot script: attach + dump_all_queues in a single command
+`dump_all_queues.sh` automates the whole "attach, source the helper, dump, detach" sequence
+above into one command -- the same idea as `save_info.gdb`, except the pid is a command-line
+argument instead of something you hand-edit into a file:
+```
+$ ./dump_all_queues.sh <pid> [output_dir]
+Attaching rocgdb to pid <pid>, running 'dump_all_queues' ...
+...
+dump_all_queues complete: rocgdb_dump_bin_pid<pid>_<timestamp>
+  ...
+[Inferior 1 (process <pid>) detached]
+
+Full rocgdb session log saved to: dump_all_queues_pid<pid>_<timestamp>.log
+```
+Re-invokes itself via `sudo` automatically if not already root (so `./dump_all_queues.sh <pid>`
+works the same whether or not you prefix `sudo` yourself). `[output_dir]` is optional, passed
+straight through to `dump_all_queues` (its own timestamped default is used if omitted). Pass
+`--txt` before the pid to run the slower live-text-decode `dump_all_queues_txt` instead of the
+default fast binary capture: `./dump_all_queues.sh --txt <pid>`. The full rocgdb session
+transcript (everything the script's rocgdb invocation printed) is also saved to
+`dump_all_queues_pid<pid>_<timestamp>.log` in the current directory, in case something needs
+double-checking after the fact (e.g. whether `attach` itself failed).
 
 ## Auto-dump everything, fast (recommended first step)
 No manual copy/paste from `info queue` needed -- this finds every HSA/DMA/XGMI queue itself,
@@ -90,7 +116,24 @@ won't stop the rest of the batch; failures are reported in the summary.
 
 Every run also writes:
 - `info_queues.log` / `info_dispatches.log` -- raw output of rocgdb's own `info queues` and
-  `info dispatches -full` commands, captured alongside the per-queue ring dumps.
+  `info dispatches -full` commands, captured alongside the per-queue ring dumps. `info queues`
+  itself never reports Read/Write for DMA/XGMI rows (amd-dbgapi's packet-ID abstraction is
+  HSA/AQL-specific -- see "SDMA rptr/wptr enrichment" below), so whenever that best-effort
+  enrichment succeeds for one or more DMA/XGMI queues, their raw rptr/wptr values are patched
+  directly into `info_queues.log`'s existing Read/Write columns, in place, in the same table
+  rocgdb itself printed -- not a separate section, and not visible only in
+  `dump_summary.json`/each queue's `.bin`/`.log` metadata:
+  ```
+    Id   Target Id                Type         Read   Write  Size     Address
+    1    AMDGPU Queue 8:1 (QID 5) DMA          21     48     8388608  0x00007f49f2400000
+    2    AMDGPU Queue 8:2 (QID 4) DMA          21     48     8388608  0x00007f49f3600000
+    3    AMDGPU Queue 8:3 (QID 3) HSA          2      2      1048576  0x00007f49f8c00000
+  ```
+  Column widths are derived from the header line itself at patch time (not hardcoded), so this
+  stays correct even if rocgdb's own formatting shifts. Nothing is patched if enrichment finds
+  nothing for a given row (no root, non-KFD host, unrecognized GPU generation, or no matching
+  queue) -- that row, and the whole file if nothing was found at all, is left exactly as rocgdb
+  wrote it.
 - `dump_summary.json` -- what this run actually captured: pid/comm/host/timestamp, HSA/DMA+XGMI
   queue counts and the list of files written for each, the backtrace/info-command file paths, and
   any per-queue failures. Meant as a quick machine- or eyeball-readable manifest of the dump
@@ -123,18 +166,49 @@ Packet #5 at 0x7e4b57600140 (64 bytes)                              KERNEL_DISPA
 (queue_viewer) > range 0 3
 (queue_viewer) > all
 (queue_viewer) > raw 5
-(queue_viewer) > rptr           # jump straight to the packet at the read pointer
-(queue_viewer) > wptr           # jump straight to the packet at the write pointer
-(queue_viewer) > packet wptr    # same as above, as a plain index expression
-(queue_viewer) > range rptr rptr+5    # decode from the read pointer through 5 packets later
-(queue_viewer) > raw wptr-1     # hex-dump the packet just before the write pointer
+(queue_viewer) > rp             # jump straight to the packet at the read pointer
+(queue_viewer) > wp             # jump straight to the packet at the write pointer
+(queue_viewer) > packet wp      # same as above, as a plain index expression
+(queue_viewer) > range rp rp+5        # decode from the read pointer through 5 packets later
+(queue_viewer) > raw wp-1       # hex-dump the packet just before the write pointer
 (queue_viewer) > quit
 ```
 The packet title always shows the total packet size (`(N bytes)`), and `N`/`A`/`B` above accept
-either a plain integer or `rptr`/`wptr` optionally followed by `+N`/`-N`, resolved the same way
-the `rptr`/`wptr` commands themselves resolve (see the previous section for what that resolution
+either a plain integer or `rp`/`wp` optionally followed by `+N`/`-N`, resolved the same way
+the `rp`/`wp` commands themselves resolve (see the previous section for what that resolution
 means for DMA/XGMI specifically). Up/down-arrow command history works in the REPL via Python's
 `readline` module (imported automatically when available; degrades to plain `input()` if not).
+
+Point the same command at a **directory** instead of one `.bin` file, and the REPL gains a
+`list`/`use` pair for switching between every queue in it, instead of being fixed to one file for
+the whole session:
+```
+$ python3 queue_viewer.py rocgdb_dump_bin_pid.../
+6 queue dump(s) found under rocgdb_dump_bin_pid.../
+   [0] dma_QID4_GPU_8_Queue_2.bin  type=DMA size=8388608 rp=21 wp=48
+   [1] dma_QID5_GPU_8_Queue_1.bin  type=DMA size=8388608 rp=21 wp=48
+   [2] hsa_QID0_GPU_8_Queue_6.bin  type=HSA size=4096 rp=2 wp=2
+   [3] hsa_QID1_GPU_8_Queue_5.bin  type=HSA size=1048576 rp=0 wp=2
+   ...
+Type 'use <index_or_name>' to select one, 'list' to see this again, 'help' for commands.
+(queue_viewer) > use 3                    # by 0-based index...
+switched to hsa_QID1_GPU_8_Queue_5.bin (HSA, qid=1)
+16384 packet(s) decoded/available (indices 0..16383)
+(queue_viewer:hsa_QID1_GPU_8_Queue_5.bin) > wp
+...
+(queue_viewer:hsa_QID1_GPU_8_Queue_5.bin) > use dma_QID4      # ...or an unambiguous filename prefix
+switched to dma_QID4_GPU_8_Queue_2.bin (DMA, qid=4)
+(queue_viewer:dma_QID4_GPU_8_Queue_2.bin) > list              # '*' marks the currently selected queue
+(queue_viewer:dma_QID4_GPU_8_Queue_2.bin) > quit
+```
+`list` (aliases `ls`/`queues`) only reads each dump's header, not its full ring bytes, so it stays
+fast regardless of how many/how large the queues in the directory are -- packet decoding only
+happens once a queue is actually selected via `use`, same as `--web`'s lazy per-queue loading. All
+of the single-file commands above (`info`/`packet`/`range`/`all`/`raw`/`rp`/`wp`) apply to
+whichever queue is currently selected; running one before any `use` prints a reminder instead of
+an error. A directory with only one `.bin` file still goes through this same `list`/`use` flow
+(matching `--web`'s behavior for consistency) rather than auto-selecting it.
+
 `queue_viewer.py` and `rocgdb_helper.py` share the exact same packet-decoding logic
 (`queue_decode.py`), so a `.bin` dump decodes identically to what `dump_all_queues_txt`'s live
 text path would have shown for the same queue. Kernel dispatch packets show the raw
@@ -149,11 +223,11 @@ For **DMA/XGMI** (SDMA-engine) queues, `info queue` never reports Read/Write in 
 place -- amd-dbgapi's packet-ID abstraction is HSA/AQL-specific and returns "not supported"
 for SDMA. `dump_all_queues`/`dump_all_queues_txt` instead make a **best-effort** attempt,
 every run, to fill these in by reading the queue's raw rptr/wptr straight out of KFD debugfs
-(see "SDMA rptr/wptr enrichment" below); when that succeeds, `rptr`/`wptr` navigation works
+(see "SDMA rptr/wptr enrichment" below); when that succeeds, `rp`/`wp` navigation works
 for DMA/XGMI too, resolving to whichever decoded packet contains that ring position (SDMA
 packets are variable-length, so there's no "packet ID" the way HSA has one -- see below for
 the exact units). When it doesn't (no root, non-KFD host, unrecognized GPU generation, or the
-queue just wasn't found), `rptr`/`wptr` print a one-line explanation instead of a value.
+queue just wasn't found), `rp`/`wp` print a one-line explanation instead of a value.
 
 ## Auto-dump everything, text (live decode, slower)
 `dump_all_queues` reads each queue's raw bytes with a single bulk memory read and decodes them
@@ -226,7 +300,7 @@ larger/longer-running queue; wrapping to a ring position happens later, at use t
 different: a ring-relative **dword position** (byte offset = value * 4), not a monotonic packet
 ID, since SDMA packets are variable-length and there's no equivalent "packet index" concept at
 the hardware level. Don't compare DMA/XGMI Read/Write numbers directly against HSA ones; they're
-stored the same way but mean different things. `rptr`/`wptr` in `queue_viewer.py` show the full
+stored the same way but mean different things. `rp`/`wp` in `queue_viewer.py` show the full
 conversion chain for this reason: `raw=N -> dword slot M -> byte offset 0x... -> packet index K
 (of TOTAL)`.
 
@@ -341,14 +415,14 @@ Open http://127.0.0.1:8765/ in a browser (Ctrl-C to stop)
 Binds to `127.0.0.1` only by default (use an SSH tunnel/port-forward to reach it from your
 laptop, e.g. `ssh -L 8765:localhost:8765 <host>`) -- pass `--host 0.0.0.0` to listen on all
 interfaces if you really want that, and `--port N` to change the port. It's a plain-text
-browser version of the REPL (pick a queue in the sidebar, click info/all/rptr/wptr, use the
+browser version of the REPL (pick a queue in the sidebar, click info/all/rp/wp, use the
 `help` button for the full command reference, or type a packet/range/raw index) -- no ring
 visualization, stdlib `http.server` only, no extra dependencies to install. `all` is capped at
 2000 packets in the browser view (says so in the output when it truncates) so a huge ring
 doesn't try to render a giant page in one go; use `range`/`packet` for anything beyond that.
 
-Full parity with the REPL: the `packet`/`range`/`raw` boxes accept `rptr`/`wptr` (optionally
-`+N`/`-N`) exactly like the REPL does, e.g. `wptr-1` or a range of `rptr` to `rptr+5`; an
+Full parity with the REPL: the `packet`/`range`/`raw` boxes accept `rp`/`wp` (optionally
+`+N`/`-N`) exactly like the REPL does, e.g. `wp-1` or a range of `rp` to `rp+5`; an
 invalid index or unknown queue name returns a clean JSON error (400/404) instead of a
 traceback. The sidebar shows each queue's type (color-coded HSA/DMA/XGMI badge), qid, decoded
 packet count, and size so you can tell queues apart without opening each one.

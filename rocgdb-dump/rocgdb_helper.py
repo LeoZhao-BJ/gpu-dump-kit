@@ -326,12 +326,20 @@ _INFO_QUEUE_ROW_RE = re.compile(
 _SDMA_LIKE_TYPES = {"DMA", "XGMI"}
 
 
-def parse_info_queue():
+def parse_info_queue(text=None):
     """Parse `info queue` into a list of dicts:
     {id, target_id, qid, type ('HSA'/'DMA'/'XGMI'/...), read, write, size, addr}.
 
     `info queue` is the only source for this -- rocgdb has no Python API for
     queues (checked: gdb.Inferior has no queue-related attributes).
+
+    text: pre-captured `info queue`/`info queues` output to parse instead of
+    executing the command again -- used by _capture_and_patch_info_queues so
+    the exact same captured text is both parsed and (after enrichment)
+    patched and saved, rather than running the command twice and risking the
+    two runs seeing different state. Defaults to executing the command
+    itself when omitted, preserving this function's original standalone
+    behavior.
 
     The columns are NOT reliably separated by a fixed number of spaces: gdb
     pads "Target Id" to a minimum width, but once the string itself (which
@@ -344,7 +352,8 @@ def parse_info_queue():
     remains (Type [Read Write] Size Address), where no field itself contains
     embedded spaces so a plain split is unambiguous.
     """
-    text = gdb.execute("info queue", to_string=True)
+    if text is None:
+        text = gdb.execute("info queue", to_string=True)
     rows = []
     for line in text.splitlines():
         m = _INFO_QUEUE_ROW_RE.match(line)
@@ -649,6 +658,146 @@ def _enrich_sdma_pointers(rows):
         row["write"] = hit[1]
 
 
+_INFO_QUEUES_HEADER_COLS = ("Type", "Read", "Write", "Size")
+
+
+def _info_queues_field_widths(header_line):
+    """Return (type_width, read_width, write_width), derived from where each
+    of _INFO_QUEUES_HEADER_COLS starts in `info queues`'s own header line.
+
+    gdb left-justifies every data row's Type/Read/Write value to exactly the
+    width implied by these header word positions -- verified empirically
+    against real captures: Size/Address always start at the same column
+    whether or not a given row's Read/Write happen to be blank (DMA/XGMI) or
+    filled in (HSA), and this holds across both narrow (single-digit) and
+    wide (6-digit) Read/Write values. These widths are therefore exactly
+    what's needed to reconstruct a patched row that lines up with the rest
+    of the table. Returns None if the header doesn't have the expected
+    column words in order (unexpected rocgdb version/format) -- callers
+    should skip patching rather than guess.
+    """
+    positions = []
+    pos = 0
+    for col in _INFO_QUEUES_HEADER_COLS:
+        idx = header_line.find(col, pos)
+        if idx == -1:
+            return None
+        positions.append(idx)
+        pos = idx + len(col)
+    type_pos, read_pos, write_pos, size_pos = positions
+    return read_pos - type_pos, write_pos - read_pos, size_pos - write_pos
+
+
+def _patch_info_queues_text(text, rows):
+    """Rewrite rocgdb's own `info queues` output, filling in Read/Write for
+    DMA/XGMI rows that _enrich_sdma_pointers() successfully resolved -- IN
+    PLACE, in the same Type/Read/Write/Size/Address table rocgdb itself
+    printed (matching column widths, not a separate appended section).
+
+    Deliberately does not rely on any *fixed* column offset for where a
+    row's Type text starts: `parse_info_queue`'s docstring already explains
+    that Target Id's padding can collapse for wide QID numbers, shifting
+    where Type begins on that specific row. Instead, each row's own Type
+    start position comes from the same regex match used to parse it
+    (`m.start(4)`, i.e. wherever that row's own Target Id actually ended),
+    and only the *widths* of the Type/Read/Write fields (derived once from
+    the header) are reused across rows -- so a row with a long Target Id
+    still gets patched at the right place. A row is only ever patched if
+    it's independently confirmed to have been blank in the original text
+    (three tokens: Type, Size, Address -- no Read/Write) and enrichment
+    found something for it. As a last defensive check, the reconstructed
+    line's Size field is compared against the row's already-parsed size
+    before committing -- if it doesn't match (meaning the width assumptions
+    didn't hold for this line, for whatever reason), that one line is left
+    untouched rather than risk corrupting it. Returns `text` completely
+    unchanged if the header doesn't have the expected column shape.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+
+    widths = _info_queues_field_widths(lines[0])
+    if widths is None:
+        return text
+    type_width, read_width, write_width = widths
+
+    def pad(s, width):
+        # Left-justify to the header-derived width as usual, BUT if a value
+        # is as wide as (or wider than) its column -- e.g. a large raw SDMA
+        # dword position -- .ljust() alone would add no padding at all,
+        # gluing it directly onto the next field with zero separating space
+        # (a real bug caught in testing: Write "2000000" immediately
+        # followed by Size "8388608" rendered as one unparseable number,
+        # "20000008388608"). Guarantee at least one space in that case,
+        # sacrificing column alignment for that one field rather than
+        # corrupting the row.
+        return s.ljust(width) if len(s) < width else s + " "
+
+    by_target_id = {r["target_id"]: r for r in rows}
+
+    out = [lines[0]]
+    for line in lines[1:]:
+        m = _INFO_QUEUE_ROW_RE.match(line)
+        row = by_target_id.get(m.group(2)) if m else None
+        rest = m.group(4).split() if m else []
+        if (
+            row is not None
+            and row["type"] in _SDMA_LIKE_TYPES
+            and row["read"] is not None
+            and len(rest) == 3  # Type, Size, Address only -- i.e. still blank
+        ):
+            type_start = m.start(4)
+            read_start = type_start + type_width
+            write_start = read_start + read_width
+            size_start = write_start + write_width
+            tail = line[size_start:]
+            if tail.lstrip().startswith(str(row["size"])):
+                line = (
+                    line[:type_start]
+                    + pad(row["type"], type_width)
+                    + pad(str(row["read"]), read_width)
+                    + pad(str(row["write"]), write_width)
+                    + tail
+                )
+        out.append(line)
+    return "".join(out)
+
+
+def _capture_and_patch_info_queues(out_dir):
+    """Capture rocgdb's own `info queues` output, parse it into rows, run the
+    best-effort SDMA rptr/wptr enrichment (_enrich_sdma_pointers) for DMA/
+    XGMI rows, patch any successfully-enriched values directly into the
+    Read/Write columns of the saved table (_patch_info_queues_text), and
+    write the result to out_dir/info_queues.log. The command is captured
+    exactly once and reused for both parsing and the file that gets saved
+    (rather than running `info queue(s)` twice and risking the two runs
+    seeing different state).
+
+    Returns (path, rows): path is None if the command itself failed to
+    execute or the file couldn't be written (rows is still returned/usable
+    for the rest of the dump either way -- info_queues.log just won't have
+    them saved to it in that case).
+    """
+    try:
+        text = gdb.execute("info queues", to_string=True)
+    except Exception as e:
+        print(f"Failed to capture 'info queues': {e}")
+        return None, []
+
+    rows = parse_info_queue(text)
+    _enrich_sdma_pointers(rows)
+    text = _patch_info_queues_text(text, rows)
+
+    path = os.path.join(out_dir, "info_queues.log")
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"Failed to write info_queues.log: {e}")
+        return None, rows
+    return path, rows
+
+
 _TARGET_ID_QID_SUFFIX_RE = re.compile(r"\s*\(QID \d+\)\s*$")
 _TARGET_ID_RE = re.compile(r"^AMDGPU Queue (\d+):(\d+)\s*\(QID \d+\)\s*$")
 
@@ -749,18 +898,15 @@ class DumpAllQueues(gdb.Command):
 
         dump_time = time.strftime("%Y-%m-%dT%H:%M:%S")
 
-        info_queues_path = _capture_gdb_command(out_dir, "info_queues.log", "info queues")
         info_dispatches_path = _capture_gdb_command(
             out_dir, "info_dispatches.log", "info dispatches -full"
         )
-
-        rows = parse_info_queue()
+        info_queues_path, rows = _capture_and_patch_info_queues(out_dir)
         if not rows:
             print(
                 "No queues found (is a process attached? try 'info queue' directly to check) "
                 "-- still capturing backtraces"
             )
-        _enrich_sdma_pointers(rows)
 
         inferior = gdb.selected_inferior()
         hsa_count = 0
@@ -912,18 +1058,15 @@ class DumpAllQueuesBinary(gdb.Command):
             print(f"Cannot create output directory {out_dir}: {e}")
             return
 
-        info_queues_path = _capture_gdb_command(out_dir, "info_queues.log", "info queues")
         info_dispatches_path = _capture_gdb_command(
             out_dir, "info_dispatches.log", "info dispatches -full"
         )
-
-        rows = parse_info_queue()
+        info_queues_path, rows = _capture_and_patch_info_queues(out_dir)
         if not rows:
             print(
                 "No queues found (is a process attached? try 'info queue' directly to check) "
                 "-- still capturing backtraces"
             )
-        _enrich_sdma_pointers(rows)
 
         inferior = gdb.selected_inferior()
         reader = GdbReader(inferior)
