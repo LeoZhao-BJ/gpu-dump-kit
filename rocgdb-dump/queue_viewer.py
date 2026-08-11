@@ -671,6 +671,8 @@ _INDEX_HTML = """<!doctype html>
     border-radius: 8px; border: 1px solid var(--border);
   }
   #output.empty { color: #6b7280; white-space: pre-wrap; font-family: var(--ui); }
+  #output .pkt-invalid { color: #f87171; font-weight: 700; }
+  #output .pkt-normal { color: #4ade80; font-weight: 700; }
   .qitem { padding: 8px 10px; margin: 3px 4px; cursor: pointer; border-radius: 6px; border: 1px solid transparent; }
   .qitem:hover { background: var(--bg); }
   .qitem.selected { background: var(--accent-bg); border-color: var(--accent); }
@@ -734,11 +736,28 @@ function api(path) {
   return fetch(path).then(r => r.json());
 }
 
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Matches a packet title line (see queue_decode.py's _render_packet_title):
+// "Packet #N at 0xADDR (SIZE bytes)" + padding + the type label. The label
+// itself may contain spaces/parens (e.g. "COPY (LINEAR)"), so it's just
+// "everything after the padding run", not a narrower token match.
+const PKT_TITLE_RE = /^(Packet #\\d+ at 0x[0-9a-fA-F]+ \\(\\d+ bytes\\))( +)(.+)$/;
+
+function colorizeLine(line) {
+  const m = line.match(PKT_TITLE_RE);
+  if (!m) return escapeHtml(line);
+  const cls = m[3] === 'INVALID' ? 'pkt-invalid' : 'pkt-normal';
+  return escapeHtml(m[1]) + m[2] + '<span class="' + cls + '">' + escapeHtml(m[3]) + '</span>';
+}
+
 function show(obj) {
   const out = document.getElementById('output');
   out.classList.remove('empty');
   if (obj.error) { out.textContent = 'error: ' + obj.error; return; }
-  out.textContent = (obj.lines || []).join('\\n');
+  out.innerHTML = (obj.lines || []).map(colorizeLine).join('\\n');
 }
 
 function badgeClass(type) {

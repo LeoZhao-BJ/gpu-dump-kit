@@ -467,13 +467,15 @@ $4 = (hsa_queue_t *) 0x7f0757fde000
   +0x3c  12 7f 00 00 ┘               | COMPLETION_SIGNAL = 0x7f1234580000
   ------------------------------------------------------------------------------------
   ```
-  When printing straight to a real terminal (the REPL, or the interactive `dump_hsa_queue`/
-  `dump_sdma_queue` commands run directly in rocgdb), the type label itself is colored -- red
-  for `INVALID`, green for everything else -- so a scroll of packet titles is easy to scan by
-  eye. Never colorized when the destination isn't a terminal a human is directly looking at
-  (`dump_all_queues_txt`'s saved `.log` files, `queue_viewer.py --web`'s JSON responses) --
-  raw ANSI escape codes would either sit uselessly in a saved log or render as garbage text in
-  a browser.
+  The type label itself is colored -- red for `INVALID`, green for everything else -- so a
+  scroll of packet titles is easy to scan by eye. In the REPL (and rocgdb's interactive
+  `dump_hsa_queue`/`dump_sdma_queue` commands) this is real ANSI, shown only when actually
+  printing to a terminal (piped/redirected output, e.g. through `tee` to a log file, stays
+  plain text). In `queue_viewer.py --web`, the server always sends plain text (raw ANSI would
+  render as garbage `\x1b[...` in a browser) -- the same coloring is instead applied
+  client-side in JS, wrapping the type label in a `<span class="pkt-invalid"|"pkt-normal">`
+  before it's inserted into the page. Never colorized in `dump_all_queues_txt`'s saved `.log`
+  files -- those are plain text meant to be read later with ordinary tools.
 - **`queue_viewer.py` REPL** -- `info`/`packet`/`range`(`r`)/`all`/`raw`/`rp`/`wp`, up/down-arrow
   command history via `readline`, `rp`/`wp` accepted as index arguments (optionally `+N`/`-N`)
   anywhere a plain integer is accepted; directory mode adds `list`/`ls`/`queues` and

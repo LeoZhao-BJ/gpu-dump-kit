@@ -336,6 +336,19 @@ in the title (`(N bytes)`).
         per-queue `.log` files) passes no `use_color` kwarg -- must never
         colorize, since these are saved files read later, not a live
         terminal session.
+- [ ] **`--web` coloring is client-side, not server-side ANSI:** every
+      `/api/queue/<name>/...` JSON response's `lines` are always plain
+      text (no `\x1b`/ANSI bytes), *even when the server process's own
+      stdout is a real terminal* -- see the previous bullet. The served
+      `index.html` contains `.pkt-invalid`/`.pkt-normal` CSS rules and a
+      `PKT_TITLE_RE` regex + `colorizeLine()` in its `<script>` that wraps
+      a packet title's trailing type label in `<span class="pkt-invalid">`
+      (red) or `<span class="pkt-normal">` (green) when building the
+      `#output` div's `innerHTML` -- i.e. the browser recognizes and
+      colors the same title-line shape the REPL colors with ANSI, just
+      applied client-side instead of server-side. Non-title lines (hex/
+      field rows, errors, etc.) are HTML-escaped and passed through
+      unstyled.
 
 ```bash
 python3 -c "
@@ -395,6 +408,30 @@ p.wait()
 text = out.decode(errors='replace')
 assert '\x1b[1;31m' in text or '\x1b[1;32m' in text, 'expected some ANSI color in a real-pty run'
 print('OK: ANSI present via pty (real terminal)')
+"
+```
+
+```bash
+# --web: server JSON must stay plain (even run via a pty), and the served
+# page must carry the client-side colorizer that recognizes the same title
+# shape the REPL colors server-side
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+DUMP_DIR=$(ls -d rocgdb_dump_bin_pid*/ | head -1)
+python3 -c "
+import pty, os, subprocess, time, urllib.request, json, re
+master, slave = pty.openpty()
+p = subprocess.Popen(['python3', 'queue_viewer.py', '$DUMP_DIR', '--web', '--port', '8799'],
+                      stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+time.sleep(1.2)
+items = json.loads(urllib.request.urlopen('http://127.0.0.1:8799/api/list').read())
+name = next(it['name'] for it in items if it['type'] == 'HSA')
+resp = urllib.request.urlopen(f'http://127.0.0.1:8799/api/queue/{name}/rp').read().decode()
+assert '\x1b' not in resp, 'server must never send raw ANSI, pty or not'
+index = urllib.request.urlopen('http://127.0.0.1:8799/').read().decode()
+assert 'pkt-invalid' in index and 'pkt-normal' in index and 'PKT_TITLE_RE' in index
+p.terminate(); p.wait()
+print('OK: web JSON plain even via pty, page carries client-side colorizer')
 "
 ```
 
