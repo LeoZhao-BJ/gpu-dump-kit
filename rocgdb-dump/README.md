@@ -132,17 +132,28 @@ read:      438427
 write:     438427
 ...
 (queue_viewer) > packet 5
-------------------------------
-Packet #5 at 0x7e4b57600140: header=0x0b02 (type=2, ...)
-Kernel Dispatch Packet Fields:
-  ...
+------------------------------------------------------------------------------------
+Packet #5 at 0x7e4b57600140 (64 bytes)                              KERNEL_DISPATCH
+------------------------------------------------------------------------------------
++0x00  02 0b 00 00                 | HEADER type=2 barrier=0 acquire=1 release=1
+                                   | SETUP = 0x0
+...
+------------------------------------------------------------------------------------
 (queue_viewer) > range 0 3
 (queue_viewer) > all
 (queue_viewer) > raw 5
-(queue_viewer) > rptr    # jump straight to the packet at the read pointer (HSA only)
-(queue_viewer) > wptr    # jump straight to the packet at the write pointer (HSA only)
+(queue_viewer) > rptr           # jump straight to the packet at the read pointer
+(queue_viewer) > wptr           # jump straight to the packet at the write pointer
+(queue_viewer) > packet wptr    # same as above, as a plain index expression
+(queue_viewer) > range rptr rptr+5    # decode from the read pointer through 5 packets later
+(queue_viewer) > raw wptr-1     # hex-dump the packet just before the write pointer
 (queue_viewer) > quit
 ```
+The packet title always shows the total packet size (`(N bytes)`), and `N`/`A`/`B` above accept
+either a plain integer or `rptr`/`wptr` optionally followed by `+N`/`-N`, resolved the same way
+the `rptr`/`wptr` commands themselves resolve (see the previous section for what that resolution
+means for DMA/XGMI specifically). Up/down-arrow command history works in the REPL via Python's
+`readline` module (imported automatically when available; degrades to plain `input()` if not).
 `queue_viewer.py` and `rocgdb_helper.py` share the exact same packet-decoding logic
 (`queue_decode.py`), so a `.bin` dump decodes identically to what `dump_all_queues`'s live
 text path would have shown for the same queue. Kernel dispatch packets show the raw
@@ -207,10 +218,16 @@ memory" spam for queues that were never going to be yours), not failures -- if y
 worth investigating (wrong offset table for this generation, a truncated/stale MQD snapshot,
 etc.), not the expected multi-tenant noise.
 
-**Units differ from HSA:** the Read/Write values this produces are a **ring-relative dword
-slot** (byte offset = value * 4), not a monotonic packet ID -- SDMA packets are variable-length,
-so there's no equivalent "packet index" concept. Don't compare DMA/XGMI Read/Write numbers
-directly against HSA ones; they mean different things.
+**Storage matches HSA; units don't.** Read/Write here are stored the same way as HSA's --
+a **raw, un-wrapped counter** (e.g. `read: 21` could just as easily have been `2097173` on a
+larger/longer-running queue; wrapping to a ring position happens later, at use time, in
+`queue_viewer.py`, exactly like HSA's raw AQL packet-ID counter does) -- but the *unit* is still
+different: a ring-relative **dword position** (byte offset = value * 4), not a monotonic packet
+ID, since SDMA packets are variable-length and there's no equivalent "packet index" concept at
+the hardware level. Don't compare DMA/XGMI Read/Write numbers directly against HSA ones; they're
+stored the same way but mean different things. `rptr`/`wptr` in `queue_viewer.py` show the full
+conversion chain for this reason: `raw=N -> dword slot M -> byte offset 0x... -> packet index K
+(of TOTAL)`.
 
 ### SDMA packet decode
 
@@ -251,7 +268,9 @@ directly against HSA ones; they mean different things.
 Each packet is displayed as a two-column view -- raw hex on the left (grouped by dword; a
 `┌`/`┘` bracket connects the two dwords of a 64-bit LO/HI field; fields sharing one dword show
 the hex only on their first row), decoded `NAME = value` text on the right, separated by `|`.
-The packet type is shown ALL CAPS at the top-right of each packet's header:
+The packet type is shown ALL CAPS at the top-right of each packet's header. This same layout
+(shared rendering code, `queue_decode.py`'s `_emit_field_groups`) is used for **both** SDMA and
+HSA packets:
 ```
 ------------------------------------------------------------------------------------
 Packet #2 at 0x7e7b51a00024                                          COPY (LINEAR)
@@ -268,6 +287,47 @@ Packet #2 at 0x7e7b51a00024                                          COPY (LINEA
 +0x18  12 f1 7f 00 ┘               | DST_ADDR = 0x7f1234570000
 ------------------------------------------------------------------------------------
 ```
+For HSA's fixed 64-byte AQL packets, `words[i]` starts at the packet's very first byte (offset
+`4*i`) rather than right after a separate header dword like SDMA -- HSA packs `SETUP` (Kernel
+Dispatch) or `TYPE` (Agent Dispatch) into the same dword as the header bits, so those fields
+naturally group under the `HEADER` row instead of getting their own hex line:
+```
+------------------------------------------------------------------------------------
+Packet #5 at 0x7e47efe23d40                                        KERNEL_DISPATCH
+------------------------------------------------------------------------------------
++0x00  02 00 01 00                 | HEADER type=2 barrier=0 acquire=0 release=0
+                                   | SETUP = 0x1
++0x04  00 01 01 00                 | WORKGROUP_X = 256
+                                   | WORKGROUP_Y = 1
++0x08  01 00 00 00                 | WORKGROUP_Z = 1
++0x0c  00 04 00 00                 | GRID_X = 1024
++0x10  01 00 00 00                 | GRID_Y = 1
++0x14  01 00 00 00                 | GRID_Z = 1
++0x18  00 00 00 00                 | PRIVATE_SEGMENT_SIZE = 0
++0x1c  00 20 00 00                 | GROUP_SEGMENT_SIZE = 8192
++0x20  00 00 56 34 ┌
++0x24  12 7f 00 00 ┘               | KERNEL_OBJECT = 0x7f1234560000
++0x28  00 00 57 34 ┌
++0x2c  12 7f 00 00 ┘               | KERNARG_ADDRESS = 0x7f1234570000
++0x30  00 00 00 00 ┌
++0x34  00 00 00 00 ┘               | (reserved)
++0x38  00 00 58 34 ┌
++0x3c  12 7f 00 00 ┘               | COMPLETION_SIGNAL = 0x7f1234580000
+------------------------------------------------------------------------------------
+```
+`Barrier And`/`Barrier Or` (`DEP_SIGNAL_0`..`_4`) and `Agent Dispatch` (`TYPE`, with bytes 8-47
+still undecoded as before -- the original decoder never broke those down either) follow the
+same convention.
+
+An `Invalid` packet (AQL type 1 -- the spec-defined state for a slot the hardware has already
+consumed and reset, which in practice can be most of a ring once it's wrapped around at least
+once) still has its fields decoded by peeking the next dword and guessing Kernel Dispatch or
+Barrier, same heuristic as the original decoder, with a `(invalid packet, reinterpreted as type
+N)` note -- but the packet's **title always shows `INVALID`**, never the guessed type. Showing
+the guessed type in the title made an idle/already-processed ring look like it was full of live
+`BARRIER_AND`/`KERNEL_DISPATCH` packets, which is actively misleading for hang debugging (you'd
+suspect a barrier storm that isn't real). The reinterpreted fields are still shown below the
+title -- only the title changed.
 
 ### Browser UI instead of the REPL
 Same tool, `--web` instead of nothing, and point it at a whole `dump_all_queues_bin` output

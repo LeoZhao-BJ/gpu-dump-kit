@@ -527,10 +527,14 @@ def _enrich_sdma_pointers(rows):
     leaves rows unchanged (still None) on any failure -- this must never
     abort a dump.
 
-    IMPORTANT: unlike HSA's read/write (monotonic AQL packet IDs), the
-    values filled in here are ring-relative dword slots (byte offset =
-    value * 4) -- SDMA packets are variable-length, so there's no equivalent
-    "packet index". Do not conflate the two when consuming this field.
+    Storage convention matches HSA's read/write exactly: a raw, un-wrapped
+    dword counter (byte offset = value * 4 before wrapping) -- NOT yet
+    reduced modulo the ring size. `queue_viewer.py` wraps it to a ring
+    position at use time, same as it already does for HSA's raw AQL
+    packet-ID counter. IMPORTANT: the *unit* still differs from HSA -- this
+    is a dword position, not a monotonic packet ID, since SDMA packets are
+    variable-length and there's no equivalent "packet index" concept at the
+    hardware level. Do not conflate the two when consuming this field.
 
     Residual caveat: matching is purely by ring base virtual address across
     every SDMA queue on the (possibly shared, multi-tenant) system, since
@@ -637,9 +641,12 @@ def _enrich_sdma_pointers(rows):
         hit = pointers_by_addr.get(row["addr"])
         if hit is None:
             continue
-        ring_size_dwords = row["size"] // 4
-        row["read"] = hit[0] % ring_size_dwords
-        row["write"] = hit[1] % ring_size_dwords
+        # Store the raw, un-wrapped dword counter -- same convention as
+        # HSA's read/write (a raw AQL packet-ID counter, e.g. "read: 438427"
+        # on a 16384-slot ring). Wrapping to a ring-relative position
+        # happens later, at use time, in queue_viewer.py -- not here.
+        row["read"] = hit[0]
+        row["write"] = hit[1]
 
 
 _TARGET_ID_QID_SUFFIX_RE = re.compile(r"\s*\(QID \d+\)\s*$")

@@ -73,6 +73,111 @@ def read_dump_header(f):
         raise ValueError(f"Corrupt dump header: {e}")
 
 
+def _hsa_decode_fields(words, symbol_lookup):
+    """Decode one 64-byte HSA AQL packet's fields. `words[i]` is the dword
+    at byte offset 4*i -- unlike the SDMA decoder, HSA's own header dword
+    (words[0]) is NOT tracked separately: it packs 'setup' (Kernel
+    Dispatch) or 'type' (Agent Dispatch) into its own upper 16 bits, so
+    those sub-fields naturally flow through the same word_ref=0 group as
+    the HEADER entry (see _emit_field_groups).
+
+    symbol_lookup(addr) -> str | None, when given, resolves a kernel_object
+    address to a human-readable name (e.g. via a live process's symbol
+    table); appended in quotes after the raw address when found.
+
+    Returns (label, fields, decoded) -- same shape as _sdma_decode_fields().
+    `fields[0]` is always the HEADER entry; `COMPLETION_SIGNAL` is always
+    appended last regardless of type, matching every AQL packet having one.
+    """
+    header = words[0] & 0xFFFF
+    type_ = header & 0xFF
+    barrier = (header >> 8) & 1
+    acquire = (header >> 9) & 3
+    release = (header >> 11) & 3
+
+    fields = [(0, f"HEADER type={type_} barrier={barrier} acquire={acquire} release={release}", None)]
+
+    def hx(name, value, word=None):
+        fields.append((word, name, f"0x{value:x}"))
+
+    def dec(name, value, word=None):
+        fields.append((word, name, str(value)))
+
+    def reserved(word):
+        fields.append((word, "(reserved)", None))
+
+    def note(text):
+        fields.append((None, text, None))
+
+    was_invalid = type_ == 1
+    if was_invalid:
+        # Invalid packet -- peek word[1] (bytes 4-7) to guess the real type,
+        # the same heuristic the original decoder used: nonzero -> kernel
+        # dispatch, zero -> barrier. Falls through to decode as that type
+        # (still useful to see what the reinterpreted fields look like),
+        # but the packet *title* stays "INVALID" -- see below -- rather
+        # than showing the guessed type as if it were a real one. No note
+        # is emitted about the reinterpretation; the INVALID title already
+        # says everything that matters.
+        type_ = 2 if words[1] != 0 else 3
+
+    label = None
+    decoded = False
+
+    if type_ == 2:  # Kernel dispatch
+        label = "KERNEL_DISPATCH"
+        setup = (words[0] >> 16) & 0xFFFF
+        hx("SETUP", setup, word=0)
+        dec("WORKGROUP_X", words[1] & 0xFFFF, word=1)
+        dec("WORKGROUP_Y", (words[1] >> 16) & 0xFFFF, word=1)
+        dec("WORKGROUP_Z", words[2] & 0xFFFF, word=2)
+        dec("GRID_X", words[3], word=3)
+        dec("GRID_Y", words[4], word=4)
+        dec("GRID_Z", words[5], word=5)
+        dec("PRIVATE_SEGMENT_SIZE", words[6], word=6)
+        dec("GROUP_SEGMENT_SIZE", words[7], word=7)
+        kernel_object = (words[9] << 32) | words[8]
+        kern_name = symbol_lookup(kernel_object) if symbol_lookup else None
+        value = f"0x{kernel_object:x}" + (f' "{kern_name}"' if kern_name else "")
+        fields.append(((8, 9), "KERNEL_OBJECT", value))
+        hx("KERNARG_ADDRESS", (words[11] << 32) | words[10], word=(10, 11))
+        reserved((12, 13))
+        decoded = True
+
+    elif type_ in (3, 5):  # Barrier And / Barrier Or
+        label = "BARRIER_AND" if type_ == 3 else "BARRIER_OR"
+        reserved(1)
+        for j in range(5):
+            lo, hi = 2 + 2 * j, 3 + 2 * j
+            hx(f"DEP_SIGNAL_{j}", (words[hi] << 32) | words[lo], word=(lo, hi))
+        reserved((12, 13))
+        decoded = True
+
+    elif type_ == 4:  # Agent dispatch
+        label = "AGENT_DISPATCH"
+        agent_type = (words[0] >> 16) & 0xFFFF
+        hx("TYPE", agent_type, word=0)
+        note("(bytes 8-47 not decoded in detail)")
+        decoded = True
+
+    hx("COMPLETION_SIGNAL", (words[15] << 32) | words[14], word=(14, 15))
+    if was_invalid:
+        label = "INVALID"  # never show the guessed type as if it were real
+    return label, fields, decoded
+
+
+def _render_hsa_packet(emit, addr, i, words, label, fields, decoded):
+    """Render one decoded HSA packet in the same two-column hex/field layout
+    as SDMA (see _emit_field_groups); `words[i]` starts at byte offset 4*i
+    (the packet's very first byte), since HSA has no separately-tracked
+    header dword the way SDMA does."""
+    _render_packet_title(emit, addr, i, 64, label if label else "UNKNOWN")  # AQL packets are always 64 bytes
+    _emit_field_groups(emit, fields, words, lambda w: 4 * w)
+    if not decoded:
+        _pkt_row(emit, "", "(not decoded in detail)")
+    emit("-" * _PKT_SEPARATOR_WIDTH)
+
+
 def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_lookup=None):
     """Decode HSA AQL packets [start_idx, end_idx) (64-byte slots) at base.
 
@@ -84,6 +189,10 @@ def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_look
     kernel_object address to a human-readable name (e.g. via a live
     process's symbol table). When None, kernel dispatch packets just show
     the raw address.
+
+    Rendered via _render_hsa_packet() as the same two-column hex/field view
+    used by the SDMA decoder -- see _hsa_decode_fields()'s docstring for
+    exactly what's decoded per packet type.
     """
     for i in range(start_idx, end_idx):
         addr = base + i * 64
@@ -93,78 +202,9 @@ def decode_hsa_packets(reader, base, start_idx, end_idx, emit=print, symbol_look
             emit(f"Cannot read memory at 0x{addr:x}")
             continue
 
-        (header,) = struct.unpack_from("<H", data, 0)
-        type_ = header & 0xFF
-        (completion_signal,) = struct.unpack_from("<Q", data, 56)
-
-        emit("-" * 30)
-        emit(
-            f"Packet #{i} at 0x{addr:x}: header=0x{header:04x} (type={type_}, barrier={(header >> 8) & 1}, acquire={(header >> 9) & 3}, release={(header >> 11) & 3})"
-        )
-
-        if type_ == 1:
-            emit("Invalid packet type, raw dump:")
-            emit(" ".join(f"{b:02x}" for b in data[:64]))
-            try:
-                (second_word,) = struct.unpack_from("<I", data, 4)
-                type_ = 2 if second_word != 0 else 3
-                emit(f"Read invalid packet as type {type_}\n")
-            except struct.error:
-                pass
-
-        if type_ == 2:  # Kernel dispatch
-            try:
-                (
-                    setup,
-                    wg_x,
-                    wg_y,
-                    wg_z,
-                    grid_x,
-                    grid_y,
-                    grid_z,
-                    pvt,
-                    grp,
-                    kern_obj,
-                    kern_arg,
-                ) = struct.unpack_from("<H HHH xx III II QQ", data, 2)
-                kern_name = None
-                if symbol_lookup is not None:
-                    kern_name = symbol_lookup(kern_obj)
-                emit("Kernel Dispatch Packet Fields:")
-                emit(f"  setup=0x{setup:x}")
-                emit(f"  workgroup=[{wg_x},{wg_y},{wg_z}]")
-                emit(f"  grid=[{grid_x},{grid_y},{grid_z}]")
-                emit(f"  private_segment_size={pvt}, group_segment_size={grp}")
-                if kern_name:
-                    emit(f'  kernel_object=0x{kern_obj:x} "{kern_name}"')
-                else:
-                    emit(f"  kernel_object=0x{kern_obj:x}")
-                emit(f"  kernarg_address=0x{kern_arg:x}")
-            except struct.error:
-                emit("  Failed to decode kernel dispatch packet")
-
-        elif type_ in (3, 5):  # Barrier And / Barrier Or
-            try:
-                dep_signals = struct.unpack_from("<5Q", data, 8)
-                emit("Barrier Packet Fields:")
-                for j, s in enumerate(dep_signals):
-                    emit(f"  dep_signal[{j}]=0x{s:x}")
-            except struct.error:
-                emit("  Failed to decode barrier packet")
-
-        elif type_ == 4:  # Agent dispatch
-            try:
-                (agend_type,) = struct.unpack_from("<H", data, 2)
-                emit("Agent Dispatch Packet Fields:")
-                emit(f"  type=0x{agend_type:x}")
-            except struct.error:
-                emit("  Failed to decode agent dispatch packet")
-
-        else:
-            emit("Unknown packet type, raw dump:")
-            emit(" ".join(f"{b:02x}" for b in data[:64]))
-
-        emit(f"  completion_signal=0x{completion_signal:x}")
+        words = list(struct.unpack_from("<16I", data, 0))
+        label, fields, decoded = _hsa_decode_fields(words, symbol_lookup)
+        _render_hsa_packet(emit, addr, i, words, label, fields, decoded)
 
 
 _POLL_REGMEM_FUNCS = ["always", "<", "<=", "==", "!=", ">=", ">", "N/A"]
@@ -796,38 +836,50 @@ def _sdma_decode_fields(op, sub_op, header_dw, words):
     return None, fields, False  # SEM.default / PRE_EXE / GPUVM_TLB_INV / GCR -- not ported
 
 
-_SDMA_LEFTCOL_WIDTH = 35  # width of the hex column (before "| "), confirmed with the user
-_SDMA_SEPARATOR_WIDTH = 84
+_PKT_LEFTCOL_WIDTH = 35  # width of the hex column (before "| "), confirmed with the user
+_PKT_SEPARATOR_WIDTH = 84
 
 
-def _sdma_hex_bytes(dword):
+def _pkt_hex_bytes(dword):
     return " ".join(f"{b:02x}" for b in struct.pack("<I", dword & 0xFFFFFFFF))
 
 
-def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size):
-    """Render one decoded SDMA packet in the two-column hex/field layout:
-    dword-grouped raw hex on the left (a bracket connects the two dwords of
-    a 64-bit LO/HI field), left-aligned "NAME = value" text on the right,
-    separated by "|". Fields sharing a dword show the hex only on their
-    first row; a dword pair spanning one field shows hex on both rows (no
-    "|" on the first) with the field text on the closing row. Packet type
-    is shown ALL CAPS at the top-right.
-    """
-    title = f"Packet #{i} at 0x{addr:x}"
-    type_label = label if label else f"OP=0x{op:x} SUB_OP=0x{sub_op:x}"
-    pad = max(1, _SDMA_SEPARATOR_WIDTH - 2 - len(title) - len(type_label))
-    emit("-" * _SDMA_SEPARATOR_WIDTH)
+def _render_packet_title(emit, addr, i, size, type_label):
+    """Emit the "Packet #N at 0x... (N bytes) <TYPE LABEL>" title framed by
+    separator lines, shared by the HSA and SDMA renderers."""
+    title = f"Packet #{i} at 0x{addr:x} ({size} bytes)"
+    pad = max(1, _PKT_SEPARATOR_WIDTH - 2 - len(title) - len(type_label))
+    emit("-" * _PKT_SEPARATOR_WIDTH)
     emit(f"{title}{' ' * pad}{type_label}")
-    emit("-" * _SDMA_SEPARATOR_WIDTH)
+    emit("-" * _PKT_SEPARATOR_WIDTH)
 
-    def row(left_text, field_text=None):
-        if field_text is None:
-            emit(left_text)  # hex-only row (e.g. bracket-open) -- no trailing pad
-        else:
-            emit(f"{left_text.ljust(_SDMA_LEFTCOL_WIDTH)}| {field_text}")
 
-    row(f"+0x00  {_sdma_hex_bytes(header_dw)}", f"HEADER op=0x{op:x} sub_op=0x{sub_op:x}")
+def _pkt_row(emit, left_text, field_text=None):
+    """Emit one two-column row: hex-only (no trailing pad) when field_text
+    is None -- e.g. a bracket-open row -- otherwise left-padded hex, "| ",
+    then the field text (already "NAME = value" or "NAME" for a bare note
+    like "(reserved)")."""
+    if field_text is None:
+        emit(left_text)
+    else:
+        emit(f"{left_text.ljust(_PKT_LEFTCOL_WIDTH)}| {field_text}")
 
+
+def _emit_field_groups(emit, fields, words, byte_offset):
+    """Shared two-column rendering core for a packet's field list (used by
+    both the SDMA and HSA decoders -- see their respective callers for what
+    "fields"/"words" mean in each case). Groups consecutive fields sharing
+    the same word_ref so the dword's hex is shown only once; draws a
+    "┌"/"┘" bracket connecting the two dwords of a 64-bit LO/HI field
+    (word_ref a 2-tuple), with the field text on the closing row only.
+    word_ref is None for fields with no independent hex to show.
+
+    `byte_offset(word_index) -> int` maps a word index to its "+0xNN" label
+    -- SDMA's words[] starts right after a separately-tracked header dword
+    (offset 4+4*i), while HSA's starts at the very first byte of the packet
+    (offset 4*i), since HSA packs 'header'/'setup'-like sub-fields into the
+    same dword rather than keeping a dedicated header dword.
+    """
     idx = 0
     n = len(fields)
     while idx < n:
@@ -839,22 +891,34 @@ def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fiel
 
         if isinstance(word_ref, tuple):
             lo, hi = word_ref
-            row(f"+0x{4 + 4 * lo:02x}  {_sdma_hex_bytes(words[lo])} ┌")
-            first_left = f"+0x{4 + 4 * hi:02x}  {_sdma_hex_bytes(words[hi])} ┘"
+            _pkt_row(emit, f"+0x{byte_offset(lo):02x}  {_pkt_hex_bytes(words[lo])} ┌")
+            first_left = f"+0x{byte_offset(hi):02x}  {_pkt_hex_bytes(words[hi])} ┘"
         elif word_ref is None:
             first_left = ""
         else:
-            first_left = f"+0x{4 + 4 * word_ref:02x}  {_sdma_hex_bytes(words[word_ref])}"
+            first_left = f"+0x{byte_offset(word_ref):02x}  {_pkt_hex_bytes(words[word_ref])}"
 
         name, value = group[0]
-        row(first_left, f"{name} = {value}")
+        _pkt_row(emit, first_left, name if value is None else f"{name} = {value}")
         for name, value in group[1:]:
-            row("", f"{name} = {value}")
+            _pkt_row(emit, "", name if value is None else f"{name} = {value}")
+
+
+def _render_sdma_packet(emit, addr, i, op, sub_op, header_dw, words, label, fields, decoded, size):
+    """Render one decoded SDMA packet in the two-column hex/field layout
+    (see _emit_field_groups for the shared mechanics). `words[i]` is the
+    dword at byte offset 4+4*i -- right after the header dword, which is
+    tracked separately and always shown as its own first row.
+    """
+    type_label = label if label else f"OP=0x{op:x} SUB_OP=0x{sub_op:x}"
+    _render_packet_title(emit, addr, i, size, type_label)
+    _pkt_row(emit, f"+0x00  {_pkt_hex_bytes(header_dw)}", f"HEADER op=0x{op:x} sub_op=0x{sub_op:x}")
+    _emit_field_groups(emit, fields, words, lambda w: 4 + 4 * w)
 
     if not decoded:
-        row("", f"(recognized, {size} bytes, not decoded in detail)")
+        _pkt_row(emit, "", "(recognized, not decoded in detail)")
 
-    emit("-" * _SDMA_SEPARATOR_WIDTH)
+    emit("-" * _PKT_SEPARATOR_WIDTH)
 
 
 def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
@@ -901,7 +965,7 @@ def decode_sdma_packets(reader, base, max_size, emit=print, _depth=0):
             break
 
         if nwords is None:
-            emit("-" * _SDMA_SEPARATOR_WIDTH)
+            emit("-" * _PKT_SEPARATOR_WIDTH)
             emit(f"Packet #{i} at 0x{addr:x}: op=0x{op:x} sub_op=0x{sub_op:x} (unrecognized opcode, stopping)")
             break
 

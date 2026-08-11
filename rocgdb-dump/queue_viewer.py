@@ -10,10 +10,11 @@ Usage:
     python3 queue_viewer.py <dump.bin>              # interactive REPL, one file
     python3 queue_viewer.py <dir_or_file> --web      # browser UI (localhost only by default)
 
-REPL prompt commands:
+REPL prompt commands (up/down-arrow command history via readline, when
+available):
     info                 show the queue's metadata (qid/type/addr/rptr/wptr/size/...)
     packet N  (p N)       decode and show packet index N
-    range A B             decode and show packets A..B (inclusive)
+    range A B  (r A B)    decode and show packets A..B (inclusive)
     all                   decode the whole ring
     raw N                 hex-dump the raw bytes for packet/slot N
     rptr / wptr           jump to the packet at the read/write pointer
@@ -21,12 +22,25 @@ REPL prompt commands:
                           carries SDMA rptr/wptr enrichment -- see README)
     help                  show this list
     quit / exit           leave
+
+N/A/B above accept a plain integer, or 'rptr'/'wptr' optionally followed by
++N/-N (e.g. "range rptr rptr+5", "raw wptr-1"), resolved the same way the
+rptr/wptr commands themselves resolve.
 """
 
 import json
 import os
 import re
 import sys
+
+try:
+    # Importing readline is enough to make input() gain up/down-arrow
+    # command history and basic line editing for free -- no other code
+    # needed. Not available on some platforms (e.g. stock Windows Python),
+    # so this degrades to plain input() there instead of failing outright.
+    import readline  # noqa: F401
+except ImportError:
+    pass
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
@@ -35,7 +49,7 @@ if _SCRIPT_DIR not in sys.path:
 import queue_decode as qd
 
 _SDMA_LIKE_TYPES = {"DMA", "XGMI"}
-_SEPARATOR = "-" * 84  # must match queue_decode.py's _SDMA_SEPARATOR_WIDTH
+_SEPARATOR = "-" * 84  # must match queue_decode.py's _PKT_SEPARATOR_WIDTH
 _PACKET_TITLE_RE = re.compile(r"^Packet #\d+ at 0x([0-9a-fA-F]+)")
 _WEB_ALL_CAP = 2000  # don't let a browser tab try to render a 100k+-packet ring in one go
 
@@ -197,11 +211,78 @@ class QueueDump:
             emit(f"  0x{addr + off:x}: {hexpart}")
 
     # -- jump straight to the rptr/wptr slot ---------------------------
+    def _resolve_pointer(self, which):
+        """Resolve rptr ('read')/wptr ('write') to a packet index, quietly
+        (no printing) -- shared by jump_to_pointer (which prints a
+        diagnostic message built from this) and resolve_pointer_index
+        (which just wants the index, e.g. for the REPL's 'wptr'/'rptr'
+        expression support). Returns a dict; 'idx' is None when
+        unavailable/unresolvable, always with enough info in the dict to
+        explain why.
+        """
+        val = self.metadata.get(which)
+        if val is None:
+            return {"idx": None, "reason": "missing"}
+
+        if self.is_hsa:
+            count = self._hsa_count()
+            if count == 0:
+                return {"idx": None, "reason": "empty"}
+            # Read/Write from `info queue` are raw, monotonically-increasing
+            # packet-ID counters, not slot indices -- same wraparound
+            # `dump_hsa_queue` itself applies (see rocgdb_helper.py:
+            # `idx %= size_bytes // 64`).
+            idx = val % count
+            return {"idx": idx, "reason": None, "val": val, "count": count}
+
+        # SDMA/XGMI: `val` is a raw, un-wrapped dword counter -- same storage
+        # convention as HSA's raw packet-ID counter (see
+        # rocgdb_helper.py's _enrich_sdma_pointers() docstring) -- but a
+        # different *unit*: a ring-relative dword position, not a packet
+        # index, since SDMA packets are variable-length and there's no
+        # equivalent "packet index" concept at the hardware level. Wrap it
+        # to a ring position the same way HSA wraps to a slot index, then
+        # convert to a byte offset and find which already-decoded packet
+        # contains it.
+        self._ensure_sdma_walked()
+        ring_size_dwords = self.metadata["size"] // 4
+        dword_slot = val % ring_size_dwords
+        byte_offset = dword_slot * 4
+        byte_addr = self.metadata["addr"] + byte_offset
+        ring_end = self.metadata["addr"] + self.metadata["size"]
+        idx = None
+        for i, start in enumerate(self._sdma_addrs):
+            if start is None:
+                continue
+            end = ring_end
+            if i + 1 < len(self._sdma_addrs) and self._sdma_addrs[i + 1] is not None:
+                end = self._sdma_addrs[i + 1]
+            if start <= byte_addr < end:
+                idx = i
+                break
+        return {
+            "idx": idx,
+            "reason": None if idx is not None else "not_found",
+            "val": val,
+            "dword_slot": dword_slot,
+            "byte_offset": byte_offset,
+            "count": self._sdma_count(),
+        }
+
+    def resolve_pointer_index(self, which):
+        """Quiet version of jump_to_pointer's resolution: returns the
+        packet index (int) rptr/wptr currently points to, or None if it
+        isn't available/resolvable for this dump. Used by the REPL to
+        support 'wptr'/'rptr' (optionally with a +N/-N offset) as
+        packet-index arguments to packet/range/raw."""
+        return self._resolve_pointer(which)["idx"]
+
     def jump_to_pointer(self, which, emit=print):
         """which: 'read' (rptr) or 'write' (wptr)."""
         label = "rptr" if which == "read" else "wptr"
-        val = self.metadata.get(which)
-        if val is None:
+        info = self._resolve_pointer(which)
+
+        if info.get("reason") == "missing":
             if self.is_hsa:
                 emit(f"no {label} recorded in this dump's metadata")
             else:
@@ -217,52 +298,30 @@ class QueueDump:
             return
 
         if self.is_hsa:
-            count = self._hsa_count()
-            if count == 0:
+            if info.get("reason") == "empty":
                 emit("queue has no packet slots (size 0)")
                 return
-            # Read/Write from `info queue` are raw, monotonically-increasing
-            # packet-ID counters, not slot indices -- same wraparound
-            # `dump_hsa_queue` itself applies (see rocgdb_helper.py:
-            # `idx %= size_bytes // 64`).
-            idx = val % count
-            emit(f"{label} (raw={val}) -> slot index {idx} (of {count})")
+            idx, count = info["idx"], info["count"]
+            emit(f"{label} (raw={info['val']}) -> slot index {idx} (of {count})")
             self.print_packets(idx, idx + 1, emit=emit)
             return
 
-        # SDMA/XGMI: `val` is a ring-relative *dword slot*, not a packet
-        # index -- packets are variable-length, so there's no equivalent
-        # "packet index" concept the way HSA has one (see rocgdb_helper.py's
-        # _enrich_sdma_pointers() docstring). Convert to a byte offset from
-        # the ring base and find which already-decoded packet contains it.
-        self._ensure_sdma_walked()
-        byte_addr = self.metadata["addr"] + val * 4
-        ring_end = self.metadata["addr"] + self.metadata["size"]
-        idx = None
-        for i, start in enumerate(self._sdma_addrs):
-            if start is None:
-                continue
-            end = ring_end
-            if i + 1 < len(self._sdma_addrs) and self._sdma_addrs[i + 1] is not None:
-                end = self._sdma_addrs[i + 1]
-            if start <= byte_addr < end:
-                idx = i
-                break
-        if idx is None:
-            emit(
-                f"{label} (dword_slot={val}) -> byte offset 0x{val * 4:x}, "
-                f"but no decoded packet contains it"
-            )
+        prefix = (
+            f"{label} (raw={info['val']}) -> dword slot {info['dword_slot']} "
+            f"-> byte offset 0x{info['byte_offset']:x}"
+        )
+        if info["idx"] is None:
+            emit(f"{prefix}, but no decoded packet contains it")
             return
-        emit(f"{label} (dword_slot={val}) -> byte offset 0x{val * 4:x} -> packet index {idx}")
-        self.print_packets(idx, idx + 1, emit=emit)
+        emit(f"{prefix} -> packet index {info['idx']} (of {info['count']})")
+        self.print_packets(info["idx"], info["idx"] + 1, emit=emit)
 
 
 HELP_TEXT = """\
 Commands:
   info                 show queue metadata (qid/type/addr/rptr/wptr/size/...)
   packet N   (p N)     decode and show packet index N
-  range A B            decode and show packets A..B (inclusive)
+  range A B  (r A B)   decode and show packets A..B (inclusive)
   all                  decode the whole ring
   raw N                hex-dump the raw bytes for packet/slot N
   rptr                 jump to and decode the packet at the read pointer
@@ -272,7 +331,35 @@ Commands:
                        (same availability note as rptr)
   help                 show this list
   quit / exit          leave
+
+N/A/B above accept a plain integer (decimal or 0x-prefixed hex), or 'rptr'/
+'wptr' optionally followed by +N/-N, resolved the same way the rptr/wptr
+commands do, e.g.:
+  packet wptr          decode the packet currently at the write pointer
+  range rptr rptr+5     decode from the read pointer through 5 packets later
+  raw wptr-1            hex-dump the packet just before the write pointer
 """
+
+_PTR_EXPR_RE = re.compile(r"^(rptr|wptr)\s*([+-]\s*\d+)?$", re.IGNORECASE)
+
+
+def _parse_index(dump, token):
+    """Parse a packet-index argument for the REPL: a plain integer (any
+    base int() accepts, e.g. '0x10'), or 'rptr'/'wptr' optionally followed
+    by a +N/-N offset (e.g. 'wptr+1', 'rptr-2'), resolved via the same
+    logic the rptr/wptr commands use (QueueDump.resolve_pointer_index).
+    Raises ValueError with a clear message on failure -- callers already
+    catch ValueError from the plain int() case, so this fits the same
+    error-handling path without any extra code at the call sites."""
+    m = _PTR_EXPR_RE.match(token)
+    if not m:
+        return int(token, 0)
+    which = "read" if m.group(1).lower() == "rptr" else "write"
+    idx = dump.resolve_pointer_index(which)
+    if idx is None:
+        raise ValueError(f"{m.group(1)} is not available for this dump")
+    offset_str = (m.group(2) or "").replace(" ", "")
+    return idx + (int(offset_str) if offset_str else 0)
 
 
 def run_repl(dump):
@@ -304,23 +391,23 @@ def run_repl(dump):
                 dump.print_info()
             elif cmd in ("packet", "p"):
                 if len(parts) != 2:
-                    print("usage: packet N")
+                    print("usage: packet N (N: int, or rptr/wptr +/-N)")
                     continue
-                n = int(parts[1], 0)
+                n = _parse_index(dump, parts[1])
                 dump.print_packets(n, n + 1)
-            elif cmd == "range":
+            elif cmd in ("range", "r"):
                 if len(parts) != 3:
-                    print("usage: range A B")
+                    print("usage: range A B (A/B: int, or rptr/wptr +/-N)")
                     continue
-                a, b = int(parts[1], 0), int(parts[2], 0)
+                a, b = _parse_index(dump, parts[1]), _parse_index(dump, parts[2])
                 dump.print_packets(a, b + 1)
             elif cmd == "all":
                 dump.print_packets(0, dump.packet_count())
             elif cmd == "raw":
                 if len(parts) != 2:
-                    print("usage: raw N")
+                    print("usage: raw N (N: int, or rptr/wptr +/-N)")
                     continue
-                dump.print_raw(int(parts[1], 0))
+                dump.print_raw(_parse_index(dump, parts[1]))
             elif cmd == "rptr":
                 dump.jump_to_pointer("read")
             elif cmd == "wptr":
