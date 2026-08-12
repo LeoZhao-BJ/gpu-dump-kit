@@ -441,10 +441,30 @@ $4 = (hsa_queue_t *) 0x7f0757fde000
   field-decoded -- still sized correctly, just shown generically (see TODO).
 - **HSA packet decode** -- Kernel Dispatch, Barrier And/Or, Agent Dispatch, and Invalid (AQL
   type 1) packets. An `Invalid` packet's fields are still decoded by peeking the next dword and
-  guessing Kernel Dispatch or Barrier, but the packet's **title always shows `INVALID`**, never
-  the guessed type -- showing the guessed type made an idle/already-processed ring (which can be
-  most of a ring once it's wrapped around at least once) look like it was full of live
-  `BARRIER_AND`/`KERNEL_DISPATCH` traffic, which is actively misleading for hang debugging.
+  guessing Kernel Dispatch, Barrier, or Barrier-Value (see next bullet), but the packet's
+  **title always shows `INVALID`**, never the guessed type -- showing the guessed type made an
+  idle/already-processed ring (which can be most of a ring once it's wrapped around at least
+  once) look like it was full of live `BARRIER_AND`/`KERNEL_DISPATCH` traffic, which is actively
+  misleading for hang debugging. Kernel Dispatch checked field-by-field against
+  `hsa_kernel_dispatch_packet_t`'s real byte offsets -- every field maps to the right word except
+  `reserved0` (word 2's upper 16 bits, right after `workgroup_size_z`), which was silently
+  dropped instead of shown as `(reserved)` like every other reserved struct field elsewhere in
+  this decoder; fixed to match.
+- **`BARRIER_VALUE` reinterpretation** -- AMD's vendor-specific `hsa_amd_barrier_value_packet_t`
+  (wait for a *signal, comparison value, mask, condition* tuple -- e.g. "wait until signal < 1"
+  -- instead of up to 5 plain `dep_signal` handles) also reports AQL header `type=1`, the same
+  as a genuinely idle/already-consumed slot, so it falls into the same reinterpretation path as
+  `KERNEL_DISPATCH`/`BARRIER_AND` above. Detected by content shape rather than the header alone
+  (`_looks_like_barrier_value` in `queue_decode.py`): the packet's three "must be 0" reserved
+  fields are actually 0, its condition field is a valid `hsa_signal_condition_t` value (`EQ`/
+  `NE`/`LT`/`GTE`), *and* its mask is non-zero (a real runtime never constructs a mask of 0 --
+  that makes the comparison always trivially "equal" regardless of the signal's value, whereas a
+  plain `BARRIER_AND` using fewer than 4 of its 5 `dep_signal` slots -- extremely common, most
+  barriers wait on 1-2 signals -- innocently looks like a zero-mask barrier-value packet without
+  that check). Verified against 18 real captured HSA `.bin` files (246k+ packets): the mask
+  check is what separates ~3.4k internally-consistent matches (100% `COND=LT`, matching the
+  exact shape confirmed against the runtime's own debug log for one such packet) from ~13k
+  false positives the reserved/cond check alone would have produced.
 - **Two-column packet display** (shared by both SDMA and HSA, `queue_decode.py`'s
   `_emit_field_groups`) -- raw hex on the left (grouped by dword; a `┌`/`┘` bracket connects the
   two dwords of a 64-bit LO/HI field), decoded `NAME = value` text on the right, separated by

@@ -91,6 +91,59 @@ def write_dump_txt_header(emit, metadata):
     )
 
 
+# hsa_signal_condition_t (from hsa.h) -- used by _looks_like_barrier_value's
+# COND sanity check and to name the field once detected.
+_SIGNAL_CONDITIONS = ["EQ", "NE", "LT", "GTE"]
+
+
+def _looks_like_barrier_value(words):
+    """True if an AQL-type-1 ("invalid") packet's leftover bytes match the
+    shape of an AMD vendor-specific hsa_amd_barrier_value_packet_t rather
+    than a plain kernel dispatch or barrier-and/or packet -- see
+    _hsa_decode_fields's was_invalid reinterpretation for why type=1 shows
+    up here at all (real-world capture confirmed: a live BarrierDispatch
+    packet -- verified against the runtime's own debug log for the exact
+    same packet -- has header type=1, not HSA_PACKET_TYPE_BARRIER_AND/OR,
+    so it lands in the same "reinterpret a type-1 slot" path as everything
+    else here).
+
+    hsa_amd_barrier_value_packet_t (bytes 8-63, i.e. words[2:16]):
+        signal (8B) / value (8B) / mask (8B) / cond (4B) / reserved1 (4B) /
+        reserved2 (8B) / reserved3 (8B) / completion_signal (8B, handled by
+        the caller already)
+    Every "reserved" field there is documented "Must be 0" when a real
+    barrier-value packet is constructed, and `cond` is a 4-value enum.
+
+    The reserved1/reserved2/reserved3 + cond-in-range check alone is NOT
+    enough, though it looks that way at first: a plain barrier-and/or
+    packet using fewer than 4 of its 5 dep_signal slots (extremely common
+    -- most barriers wait on 1-2 signals, not all 5) legitimately has
+    dep_signal[3]/[4] == 0 too, which trivially satisfies "reserved == 0"
+    and "cond (dep_signal[3]'s low dword) == 0" by coincidence, not because
+    it's really a barrier-value packet. Caught exactly this on a real
+    18-file capture: requiring only the reserved/cond shape produced ~13k
+    matches, of which mask (words[6:8]) was 0 in all but 3.4k -- a mask of
+    0 makes the AND-compare degenerate (always "equal", since
+    signal_value & 0 == 0 regardless of the signal's real value), which a
+    real runtime never constructs on purpose, so requiring mask != 0 is
+    what actually separates genuine hits from this false-positive shape.
+    The surviving 3.4k were internally consistent (100% COND=LT, plausible
+    heap-pointer-looking signal addresses, plausible small compare values)
+    -- see TEST_PLAN.md for the exact counts.
+
+    (Caller has already confirmed words[1] == 0, matching
+    hsa_amd_barrier_value_packet_t's reserved0.)"""
+    return (
+        words[9] == 0
+        and words[10] == 0
+        and words[11] == 0
+        and words[12] == 0
+        and words[13] == 0
+        and 0 <= words[8] < len(_SIGNAL_CONDITIONS)
+        and (words[6] != 0 or words[7] != 0)  # mask -- see docstring
+    )
+
+
 def _hsa_decode_fields(words, symbol_lookup):
     """Decode one 64-byte HSA AQL packet's fields. `words[i]` is the dword
     at byte offset 4*i -- unlike the SDMA decoder, HSA's own header dword
@@ -128,27 +181,51 @@ def _hsa_decode_fields(words, symbol_lookup):
         fields.append((None, text, None))
 
     was_invalid = type_ == 1
+    barrier_value = False
     if was_invalid:
-        # Invalid packet -- peek word[1] (bytes 4-7) to guess the real type,
-        # the same heuristic the original decoder used: nonzero -> kernel
-        # dispatch, zero -> barrier. Falls through to decode as that type
-        # (still useful to see what the reinterpreted fields look like),
-        # but the packet *title* stays "INVALID" -- see below -- rather
-        # than showing the guessed type as if it were a real one. No note
-        # is emitted about the reinterpretation; the INVALID title already
-        # says everything that matters.
-        type_ = 2 if words[1] != 0 else 3
+        # Invalid packet -- peek the leftover bytes to guess the real type,
+        # the same heuristic the original decoder used: word[1] nonzero ->
+        # kernel dispatch, word[1] zero -> barrier-shaped. Real-world
+        # capture showed a third shape hiding behind "word[1] zero": AMD's
+        # vendor-specific hsa_amd_barrier_value_packet_t (a barrier that
+        # waits on a signal/value/mask/cond comparison instead of up to 5
+        # dep_signal handles) ALSO reports header type=1 -- see
+        # _looks_like_barrier_value's docstring for the content-based check
+        # that tells the two apart. Falls through to decode as whichever
+        # type this resolves to (still useful to see what the reinterpreted
+        # fields look like), but the packet *title* stays "INVALID" -- see
+        # below -- rather than showing the guessed type as if it were a
+        # real one. No note is emitted about the reinterpretation; the
+        # INVALID title already says everything that matters.
+        if words[1] == 0 and _looks_like_barrier_value(words):
+            barrier_value = True
+        else:
+            type_ = 2 if words[1] != 0 else 3
 
     label = None
     decoded = False
 
-    if type_ == 2:  # Kernel dispatch
+    if barrier_value:  # AMD vendor-specific hsa_amd_barrier_value_packet_t
+        label = "BARRIER_VALUE"
+        reserved(1)
+        hx("DEP_SIGNAL", (words[3] << 32) | words[2], word=(2, 3))
+        hx("VALUE", (words[5] << 32) | words[4], word=(4, 5))
+        hx("MASK", (words[7] << 32) | words[6], word=(6, 7))
+        cond = words[8]
+        fields.append((8, "COND", f"{_SIGNAL_CONDITIONS[cond]}({cond})"))
+        reserved(9)
+        reserved((10, 11))
+        reserved((12, 13))
+        decoded = True
+
+    elif type_ == 2:  # Kernel dispatch
         label = "KERNEL_DISPATCH"
         setup = (words[0] >> 16) & 0xFFFF
         hx("SETUP", setup, word=0)
         dec("WORKGROUP_X", words[1] & 0xFFFF, word=1)
         dec("WORKGROUP_Y", (words[1] >> 16) & 0xFFFF, word=1)
         dec("WORKGROUP_Z", words[2] & 0xFFFF, word=2)
+        reserved(2)  # reserved0 -- the upper 16 bits of word 2, after workgroup_size_z
         dec("GRID_X", words[3], word=3)
         dec("GRID_Y", words[4], word=4)
         dec("GRID_Z", words[5], word=5)

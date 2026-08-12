@@ -257,9 +257,14 @@ Agent Dispatch, Invalid/Unknown -- same rendering core as SDMA
 
 - [ ] **Kernel Dispatch**: `WORKGROUP_X/Y/Z` and `GRID_X/Y/Z` shown as
       separate rows (not a combined `[x,y,z]` array); `SETUP` groups under
-      the same dword as `HEADER`; `KERNEL_OBJECT` shows resolved symbol
-      name in quotes when `symbol_lookup` finds one; `(reserved)` shown for
-      the unused 8 bytes between `KERNARG_ADDRESS` and `COMPLETION_SIGNAL`.
+      the same dword as `HEADER`; `(reserved)` (the struct's `reserved0`)
+      groups under the same dword as `WORKGROUP_Z` (word 2's upper 16
+      bits) -- checked field-by-field against `hsa_kernel_dispatch_packet_t`
+      byte offsets and found correct everywhere except this one, which
+      silently dropped `reserved0` entirely before being fixed;
+      `KERNEL_OBJECT` shows resolved symbol name in quotes when
+      `symbol_lookup` finds one; `(reserved)` shown for the unused 8 bytes
+      (`reserved2`) between `KERNARG_ADDRESS` and `COMPLETION_SIGNAL`.
 - [ ] **Barrier And/Or**: `DEP_SIGNAL_0`..`_4`, with `(reserved)` for the
       unused dword between `HEADER` and `DEP_SIGNAL_0`.
 - [ ] **Agent Dispatch**: `TYPE` field, `(bytes 8-47 not decoded in detail)` note.
@@ -271,6 +276,30 @@ Agent Dispatch, Invalid/Unknown -- same rendering core as SDMA
       no `(invalid packet, reinterpreted as type N)` note line; that note
       was removed per user request since the `INVALID` title already says
       everything that matters).
+- [ ] **`BARRIER_VALUE` reinterpretation** (AMD vendor-specific
+      `hsa_amd_barrier_value_packet_t`, `_looks_like_barrier_value` in
+      `queue_decode.py`): a type-1 packet whose bytes match this shape
+      decodes as `DEP_SIGNAL`/`VALUE`/`MASK`/`COND` (condition name +
+      numeric value, e.g. `LT(2)`) instead of the generic `DEP_SIGNAL_0..4`
+      array -- title still says `INVALID`, same rule as above.
+      - [ ] Real bug this fixes: the exact packet
+            `BarrierDispatch: device_id=1, queue_id=7,
+            dep_signal=0x7f4726b70a00 (value=0x1, mask=0x7fffffffffffffff,
+            cond=LT), completion_signal=0x7f4726be0580` (confirmed against
+            the runtime's own debug log) was previously shown as a generic
+            reinterpreted `BARRIER_AND` with `DEP_SIGNAL_1`=`0x1`,
+            `DEP_SIGNAL_2`=`0x7fffffffffffffff`, `DEP_SIGNAL_3`=`0x2` --
+            field names and meaning both wrong.
+      - [ ] **False-positive guard, the tricky part:** the shape check
+            requires `MASK != 0` in addition to the reserved-fields-are-0 +
+            cond-in-range check -- without it, a plain `BARRIER_AND` using
+            fewer than 4 of its 5 `dep_signal` slots (very common) also
+            satisfies "reserved fields are 0, low dword looks like a valid
+            cond" purely by having unused `dep_signal[3]`/`[4]` slots equal
+            to 0. Confirmed on real data: without the mask check, ~13k of
+            246k+ packets across 18 real HSA `.bin` files matched: with it,
+            only ~3.4k do, and 100% of those have `COND=LT` (internally
+            consistent, not noise).
 - [ ] Replay against a real captured HSA `.bin` (16k+ packets) -- zero
       decode errors across the whole ring.
 - [ ] `rp`/`wp` jump navigation still works for HSA after all the
@@ -283,6 +312,88 @@ python3 queue_viewer.py <real_hsa>.bin
 # grep the captured output for title lines and confirm label distribution
 # makes sense (e.g. INVALID for idle/already-consumed slots, not
 # KERNEL_DISPATCH/BARRIER_AND)
+```
+
+```bash
+# Kernel Dispatch reserved0: must be shown, and must not corrupt WORKGROUP_Z
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+python3 -c "
+import struct, sys
+sys.path.insert(0, '.')
+import queue_decode as qd
+
+class R:
+    def __init__(self, base, buf): self.base, self.buf = base, buf
+    def read(self, addr, size): return self.buf[addr-self.base:addr-self.base+size]
+
+base = 0x7e4b57600000
+words = [
+    (2 | (1 << 16)),           # header type=2, setup=1
+    (256 | (1 << 16)),         # WORKGROUP_X=256, WORKGROUP_Y=1
+    (1 | (0xdead << 16)),      # WORKGROUP_Z=1, reserved0=0xdead (garbage on purpose)
+    1024, 1, 1, 0, 8192,
+    0x34560000, 0x00007f12,
+    0x34570000, 0x00007f12,
+    0, 0,
+    0x34580000, 0x00007f12,
+]
+buf = b''.join(struct.pack('<I', w) for w in words)
+lines = []
+qd.decode_hsa_packets(R(base, buf), base, 0, 1, emit=lines.append)
+text = '\n'.join(lines)
+assert 'WORKGROUP_Z = 1' in text, text          # reserved0 garbage must not leak into the value
+assert text.count('(reserved)') == 2            # reserved0 (new) + reserved2 (pre-existing)
+print('OK')
+"
+```
+
+```bash
+# BARRIER_VALUE: exact real-world packet reproduction + false-positive-guard regression
+cd /home/liangzh/umr/gpu-dump-kit/rocgdb-dump
+python3 -c "
+import struct, sys
+sys.path.insert(0, '.')
+import queue_decode as qd
+
+class R:
+    def __init__(self, base, buf): self.base, self.buf = base, buf
+    def read(self, addr, size): return self.buf[addr-self.base:addr-self.base+size]
+
+base = 0x7f4a9b435900
+words = [
+    0x00000001, 0x00000000,
+    0x26b70a00, 0x00007f47,   # DEP_SIGNAL = 0x7f4726b70a00
+    0x00000001, 0x00000000,   # VALUE = 0x1
+    0xffffffff, 0x7fffffff,   # MASK = 0x7fffffffffffffff
+    0x00000002, 0x00000000,   # COND = LT(2)
+    0x00000000, 0x00000000,
+    0x00000000, 0x00000000,
+    0x26be0580, 0x00007f47,   # COMPLETION_SIGNAL = 0x7f4726be0580
+]
+buf = b''.join(struct.pack('<I', w) for w in words)
+lines = []
+qd.decode_hsa_packets(R(base, buf), base, 0, 1, emit=lines.append)
+text = '\n'.join(lines)
+assert text.splitlines()[1].rstrip().endswith('INVALID')
+assert 'DEP_SIGNAL = 0x7f4726b70a00' in text
+assert 'VALUE = 0x1' in text
+assert 'MASK = 0x7fffffffffffffff' in text
+assert 'COND = LT(2)' in text
+assert 'COMPLETION_SIGNAL = 0x7f4726be0580' in text
+
+# false-positive guard: a plain BARRIER_AND with only dep_signal[0]
+# populated (dep_signal[1..4] all 0) must NOT be reinterpreted as
+# BARRIER_VALUE -- mask (dep_signal[2]) is 0, so it should fall through
+# to the generic DEP_SIGNAL_0..4 guess instead.
+words2 = [0x00000001, 0] + [0x11111111, 0x00007f11] + [0]*12
+words2[15] = 0x00007f22  # give COMPLETION_SIGNAL a nonzero high word too
+buf2 = b''.join(struct.pack('<I', w) for w in words2)
+lines2 = []
+qd.decode_hsa_packets(R(base, buf2), base, 0, 1, emit=lines2.append)
+text2 = '\n'.join(lines2)
+assert 'DEP_SIGNAL_0' in text2 and 'COND' not in text2, text2
+print('OK')
+"
 ```
 
 ---
