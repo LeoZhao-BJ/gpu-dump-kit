@@ -581,6 +581,9 @@ def run_repl_dir(path):
             )
         return None
 
+    def _hex_or_none(v):
+        return f"0x{v:x}" if isinstance(v, int) else v
+
     def print_list():
         for i, name in enumerate(names):
             marker = "*" if name == current[0] else " "
@@ -588,12 +591,14 @@ def run_repl_dir(path):
                 m = _peek_dump_metadata(paths_by_name[name])
                 # qid/target_id are already encoded in the filename itself
                 # (e.g. dma_QID11_GPU_7_Queue_22.bin) -- no need to repeat
-                # them here. rp/wp (raw, un-wrapped -- same convention as
-                # 'info') are the useful at-a-glance values instead, since
-                # they're not derivable from the filename.
+                # them here. rp/wp (raw, un-wrapped) are the useful
+                # at-a-glance values instead, since they're not derivable
+                # from the filename. Shown in hex here (unlike 'info', which
+                # keeps them decimal) since these are byte offsets people
+                # usually want to compare against other hex addresses.
                 detail = (
                     f"type={m.get('type')} size={m.get('size')} "
-                    f"rp={m.get('read')} wp={m.get('write')}"
+                    f"rp={_hex_or_none(m.get('read'))} wp={_hex_or_none(m.get('write'))}"
                 )
                 pending = _is_pending(m)
             except Exception as e:
